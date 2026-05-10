@@ -88,6 +88,8 @@ class NemotronConfig:
     num_shared_experts: int = 1
     top_k: int = 2
     expert_hidden_dim: int = 256
+    granularity_factor: int = 1
+    scale_top_k_with_granularity: bool = True
     moe_aux_loss_weight: float = 1e-4
 
     # Normalization and numerical stability
@@ -103,7 +105,8 @@ class NemotronConfig:
         - paper_close: larger profile that is closer to Nemotron-3-Nano style
 
         The paper_close preset increases attention heads, expert count, and
-        uses top_k=6 routing while still keeping this implementation simple.
+        uses top_k=6 routing with stronger granular MoE settings while still
+        keeping this implementation simple.
         """
         key = preset.strip().lower()
 
@@ -132,6 +135,8 @@ class NemotronConfig:
                 num_shared_experts=2,
                 top_k=6,
                 expert_hidden_dim=1856,
+                granularity_factor=2,
+                scale_top_k_with_granularity=True,
                 moe_aux_loss_weight=1e-4,
                 rms_norm_eps=1e-6,
             )
@@ -166,6 +171,16 @@ class NemotronConfig:
         # MoE routing constraints.
         assert self.top_k > 0, "top_k must be > 0"
         assert self.top_k <= self.num_experts, "top_k must be <= num_experts"
+        assert self.granularity_factor > 0, "granularity_factor must be > 0"
+
+        effective_num_routed_experts = self.num_experts * self.granularity_factor
+        if self.scale_top_k_with_granularity:
+            effective_top_k = self.top_k * self.granularity_factor
+        else:
+            effective_top_k = self.top_k
+        assert effective_top_k <= effective_num_routed_experts, (
+            "effective routed top-k must be <= effective routed experts"
+        )
 
 
 class NemotronBlock(nnx.Module):
@@ -229,6 +244,8 @@ class NemotronBlock(nnx.Module):
             num_shared_experts=config.num_shared_experts,
             top_k=config.top_k,
             expert_hidden_dim=config.expert_hidden_dim,
+            granularity_factor=config.granularity_factor,
+            scale_top_k_with_granularity=config.scale_top_k_with_granularity,
             use_bias=False,
             rngs=rngs,
         )
