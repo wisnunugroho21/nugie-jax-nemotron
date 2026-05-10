@@ -17,7 +17,7 @@ What is intentionally simplified:
 - Tiny default dimensions for local experimentation
 - Alternating layer pattern instead of large paper-scale block scheduling
 - No distributed/expert-parallel optimization
-- No auxiliary load-balancing loss
+- Uses a simple auxiliary load-balancing loss (minimal implementation)
 """
 
 from dataclasses import dataclass
@@ -88,6 +88,7 @@ class NemotronConfig:
     num_shared_experts: int = 1
     top_k: int = 2
     expert_hidden_dim: int = 256
+    moe_aux_loss_weight: float = 1e-4
 
     # Normalization and numerical stability
     rms_norm_eps: float = 1e-6
@@ -181,11 +182,18 @@ class NemotronBlock(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: jax.Array, return_aux_loss: bool = False
+    ) -> jax.Array | tuple[jax.Array, jax.Array]:
         # Mixer residual path.
         x = x + self.mixer(self.norm_mixer(x))
 
         # MoE residual path.
+        if return_aux_loss:
+            moe_out, moe_aux_loss = self.moe(self.norm_moe(x), return_aux_loss=True)
+            x = x + moe_out
+            return x, moe_aux_loss
+
         x = x + self.moe(self.norm_moe(x))
         return x
 
@@ -225,15 +233,26 @@ class NemotronNanoLM(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, token_ids: jax.Array) -> jax.Array:
+    def __call__(
+        self, token_ids: jax.Array, return_aux_loss: bool = False
+    ) -> jax.Array | tuple[jax.Array, jax.Array]:
         x = self.embedding(token_ids)
+        total_aux_loss = jnp.array(0.0, dtype=jnp.float32)
 
         for i in range(self.num_layers):
             block = getattr(self, f"block_{i}")
-            x = block(x)
+            if return_aux_loss:
+                x, block_aux_loss = block(x, return_aux_loss=True)
+                total_aux_loss = total_aux_loss + block_aux_loss
+            else:
+                x = block(x)
 
         x = self.final_norm(x)
         logits = self.lm_head(x)
+        if return_aux_loss:
+            # Average over blocks to keep scale more stable across depth.
+            total_aux_loss = total_aux_loss / self.num_layers
+            return logits, total_aux_loss
         return logits
 
 
@@ -246,6 +265,19 @@ def cross_entropy_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
     """Standard language-model cross-entropy loss."""
     one_hot = jax.nn.one_hot(labels, logits.shape[-1])
     return optax.softmax_cross_entropy(logits, one_hot).mean()
+
+
+def total_training_loss(
+    logits: jax.Array,
+    labels: jax.Array,
+    moe_aux_loss: jax.Array,
+    moe_aux_loss_weight: float,
+) -> jax.Array:
+    """
+    Combines language-model cross-entropy and MoE auxiliary loss.
+    """
+    ce_loss = cross_entropy_loss(logits, labels)
+    return ce_loss + moe_aux_loss_weight * moe_aux_loss
 
 
 def demo() -> None:
@@ -275,26 +307,39 @@ def demo() -> None:
     y_target = jax.random.randint(rngs(), (batch_size, seqlen), 0, config.vocab_size)
 
     # Check forward shape once before training.
-    logits = model(x)
+    logits, aux_loss = model(x, return_aux_loss=True)
     assert logits.shape == (batch_size, seqlen, config.vocab_size), (
         "Unexpected logits shape"
     )
     print(f"Forward shape OK: {logits.shape}")
+    print(f"Initial MoE aux loss: {aux_loss:.6f}")
 
     @nnx.jit
     def train_step(model, optimizer, x_batch, y_batch):
         def loss_fn(model):
-            logits_local = model(x_batch)
-            return cross_entropy_loss(logits_local, y_batch)
+            logits_local, moe_aux_local = model(x_batch, return_aux_loss=True)
+            total_loss = total_training_loss(
+                logits=logits_local,
+                labels=y_batch,
+                moe_aux_loss=moe_aux_local,
+                moe_aux_loss_weight=config.moe_aux_loss_weight,
+            )
+            ce_loss = cross_entropy_loss(logits_local, y_batch)
+            return total_loss, (ce_loss, moe_aux_local)
 
-        loss, grads = nnx.value_and_grad(loss_fn)(model)
+        (loss, (ce_loss, moe_aux_loss)), grads = nnx.value_and_grad(
+            loss_fn, has_aux=True
+        )(model)
         optimizer.update(model, grads)
-        return loss
+        return loss, ce_loss, moe_aux_loss
 
     print("Training (5 steps):")
     for step in range(5):
-        loss = train_step(model, optimizer, x, y_target)
-        print(f"  Step {step + 1}/5 | Loss: {loss:.4f}")
+        loss, ce_loss, moe_aux_loss = train_step(model, optimizer, x, y_target)
+        print(
+            f"  Step {step + 1}/5 | Total: {loss:.4f} | "
+            f"CE: {ce_loss:.4f} | MoE Aux: {moe_aux_loss:.4f}"
+        )
 
     print("Done.")
 

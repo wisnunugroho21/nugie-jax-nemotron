@@ -6,6 +6,7 @@ This module follows the Nemotron-style MoE idea in a simple educational form:
 - Shared experts are always active
 - Router uses sigmoid scores
 - Experts use Squared-ReLU activation
+- Includes a load-balancing auxiliary loss for routed experts
 
 The implementation is intentionally explicit (loop-based) for readability.
 """
@@ -148,12 +149,57 @@ class SparseMoE(nnx.Module):
             outputs.append(expert(x_flat))
         return jnp.stack(outputs, axis=1)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def _load_balancing_aux_loss(
+        self, routed_scores: jax.Array, topk_indices: jax.Array
+    ) -> jax.Array:
+        """
+        Computes a simple load-balancing auxiliary loss for routed experts.
+
+        We combine two signals per expert:
+        1) Dispatch fraction: how often tokens are actually sent to that expert.
+        2) Mean router probability: how much probability mass the router gives it.
+
+        The product encourages experts to receive both routing probability and
+        actual token assignments in a more balanced way.
+
+        Args:
+            routed_scores: Sigmoid router scores for routed experts,
+                           shape (num_tokens, num_experts)
+            topk_indices: Top-k expert indices per token,
+                          shape (num_tokens, top_k)
+        Returns:
+            aux_loss: Scalar load-balancing loss.
+        """
+        num_tokens = routed_scores.shape[0]
+
+        # Convert scores into per-token normalized probabilities.
+        routed_probs = routed_scores / (
+            jnp.sum(routed_scores, axis=-1, keepdims=True) + 1e-6
+        )
+
+        # Build a binary dispatch mask from top-k assignments.
+        dispatch_mask = jnp.zeros_like(routed_scores)
+        token_ids = jnp.arange(num_tokens)[:, None]
+        dispatch_mask = dispatch_mask.at[token_ids, topk_indices].set(1.0)
+
+        # Each token contributes total mass 1.0 across its selected experts.
+        dispatch_fraction = jnp.mean(dispatch_mask / self.top_k, axis=0)
+        mean_router_prob = jnp.mean(routed_probs, axis=0)
+
+        # Switch-style balancing form, scaled by number of experts.
+        aux_loss = self.num_experts * jnp.sum(dispatch_fraction * mean_router_prob)
+        return aux_loss
+
+    def __call__(
+        self, x: jax.Array, return_aux_loss: bool = False
+    ) -> jax.Array | tuple[jax.Array, jax.Array]:
         """
         Args:
             x: (batch, seqlen, d_model)
+            return_aux_loss: If True, also returns routed expert balancing loss.
         Returns:
             y: (batch, seqlen, d_model)
+            aux_loss (optional): scalar load-balancing loss
         """
         batch, seqlen, d_model = x.shape
         assert d_model == self.d_model, "Input d_model does not match MoE config"
@@ -170,6 +216,9 @@ class SparseMoE(nnx.Module):
 
         # Select top-k routed experts per token.
         topk_values, topk_indices = jax.lax.top_k(routed_scores, self.top_k)
+
+        # Load-balancing auxiliary loss only uses routed experts.
+        aux_loss = self._load_balancing_aux_loss(routed_scores, topk_indices)
 
         # Build sparse top-k gate matrix for routed experts.
         routed_gates = jnp.zeros_like(routed_scores)
@@ -199,4 +248,6 @@ class SparseMoE(nnx.Module):
             y_flat = routed_mix
 
         y = jnp.reshape(y_flat, (batch, seqlen, d_model))
+        if return_aux_loss:
+            return y, aux_loss
         return y
