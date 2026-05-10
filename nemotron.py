@@ -31,6 +31,21 @@ from attention import GroupedQueryAttention
 from mamba_2 import Mamba2Block
 from moe import SparseMoE
 
+
+BlockOutput = jax.Array | tuple[jax.Array, jax.Array]
+
+
+def _default_patterns() -> list[tuple[str, int]]:
+    return [
+        ("mamba_moe", 2),
+        ("mamba_attention_moe", 1),
+        ("mamba_moe", 2),
+        ("mamba_attention_moe", 1),
+        ("mamba_moe", 2),
+        ("mamba_attention_moe", 1),
+        ("mamba_moe", 1),
+    ]
+
 @dataclass
 class NemotronConfig:
     """
@@ -45,17 +60,7 @@ class NemotronConfig:
     vocab_size: int = 1000
     d_model: int = 128
 
-    patterns: list[tuple[str, int]] = field(
-        default_factory=lambda: [
-            ("mamba_moe", 2),
-            ("mamba_attention_moe", 1),
-            ("mamba_moe", 2),
-            ("mamba_attention_moe", 1),
-            ("mamba_moe", 2),
-            ("mamba_attention_moe", 1),
-            ("mamba_moe", 1),
-        ]
-    )
+    patterns: list[tuple[str, int]] = field(default_factory=_default_patterns)
 
     # Attention (GQA)
     num_attention_heads: int = 4
@@ -99,15 +104,7 @@ class NemotronConfig:
 
         if key in ("tiny", "default"):
             return cls(
-                patterns=[
-                    ("mamba_moe", 2),
-                    ("mamba_attention_moe", 1),
-                    ("mamba_moe", 2),
-                    ("mamba_attention_moe", 1),
-                    ("mamba_moe", 2),
-                    ("mamba_attention_moe", 1),
-                    ("mamba_moe", 1)
-                ]
+                patterns=_default_patterns(),
             )
 
         if key in ("paper_close", "paper-close", "paper"):
@@ -195,6 +192,52 @@ class NemotronConfig:
         )
 
 
+def _build_mamba(config: NemotronConfig, rngs: nnx.Rngs) -> Mamba2Block:
+    return Mamba2Block(
+        d_model=config.d_model,
+        d_state=config.mamba_d_state,
+        d_conv=config.mamba_d_conv,
+        expand=config.mamba_expand,
+        headdim=config.mamba_headdim,
+        ngroups=config.mamba_ngroups,
+        chunk_size=config.mamba_chunk_size,
+        rngs=rngs,
+    )
+
+
+def _build_moe(config: NemotronConfig, rngs: nnx.Rngs) -> SparseMoE:
+    return SparseMoE(
+        d_model=config.d_model,
+        num_experts=config.num_experts,
+        num_shared_experts=config.num_shared_experts,
+        top_k=config.top_k,
+        expert_hidden_dim=config.expert_hidden_dim,
+        granularity_factor=config.granularity_factor,
+        scale_top_k_with_granularity=config.scale_top_k_with_granularity,
+        use_bias=False,
+        rngs=rngs,
+    )
+
+
+def _apply_moe_residual(
+    x: jax.Array,
+    norm_moe: nnx.RMSNorm,
+    moe: SparseMoE,
+    return_aux_loss: bool,
+) -> BlockOutput:
+    # Keep aux-loss semantics identical across all block variants.
+    if return_aux_loss:
+        moe_out, moe_aux_loss = moe(norm_moe(x), return_aux_loss=True)
+        x = x + moe_out
+        return x, moe_aux_loss
+
+    moe_out = moe(norm_moe(x), return_aux_loss=False)
+    if isinstance(moe_out, tuple):
+        raise RuntimeError("Expected SparseMoE to return only tensor output")
+    x = x + moe_out
+    return x
+
+
 class MambaMoEBlock(nnx.Module):
     """
     Hybrid Mamba & MoE block.
@@ -215,47 +258,24 @@ class MambaMoEBlock(nnx.Module):
         self.norm_moe = nnx.RMSNorm(config.d_model, rngs=rngs)
 
         # Reuse the already-implemented Mamba-2 block
-        self.mamba = Mamba2Block(
-            d_model=config.d_model,
-            d_state=config.mamba_d_state,
-            d_conv=config.mamba_d_conv,
-            expand=config.mamba_expand,
-            headdim=config.mamba_headdim,
-            ngroups=config.mamba_ngroups,
-            chunk_size=config.mamba_chunk_size,
-            rngs=rngs,
-        )
+        self.mamba = _build_mamba(config=config, rngs=rngs)
 
         # MoE stage after every mixer layer.
-        self.moe = SparseMoE(
-            d_model=config.d_model,
-            num_experts=config.num_experts,
-            num_shared_experts=config.num_shared_experts,
-            top_k=config.top_k,
-            expert_hidden_dim=config.expert_hidden_dim,
-            granularity_factor=config.granularity_factor,
-            scale_top_k_with_granularity=config.scale_top_k_with_granularity,
-            use_bias=False,
-            rngs=rngs,
-        )
+        self.moe = _build_moe(config=config, rngs=rngs)
 
     def __call__(
             self, x: jax.Array, return_aux_loss: bool = False
-    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+    ) -> BlockOutput:
         # Mamba residual path.
         x = x + self.mamba(self.norm_mamba(x))
 
         # MoE residual path.
-        if return_aux_loss:
-            moe_out, moe_aux_loss = self.moe(self.norm_moe(x), return_aux_loss=True)
-            x = x + moe_out
-            return x, moe_aux_loss
-
-        moe_out = self.moe(self.norm_moe(x), return_aux_loss=False)
-        if isinstance(moe_out, tuple):
-            raise RuntimeError("Expected SparseMoE to return only tensor output")
-        x = x + moe_out
-        return x
+        return _apply_moe_residual(
+            x=x,
+            norm_moe=self.norm_moe,
+            moe=self.moe,
+            return_aux_loss=return_aux_loss,
+        )
 
 
 class MambaAttentionMoEBlock(nnx.Module):
@@ -280,16 +300,7 @@ class MambaAttentionMoEBlock(nnx.Module):
         self.norm_moe = nnx.RMSNorm(config.d_model, rngs=rngs)
 
         # Reuse the already-implemented Mamba-2 block as the mixer.
-        self.mamba = Mamba2Block(
-            d_model=config.d_model,
-            d_state=config.mamba_d_state,
-            d_conv=config.mamba_d_conv,
-            expand=config.mamba_expand,
-            headdim=config.mamba_headdim,
-            ngroups=config.mamba_ngroups,
-            chunk_size=config.mamba_chunk_size,
-            rngs=rngs,
-        )
+        self.mamba = _build_mamba(config=config, rngs=rngs)
 
         self.attention = GroupedQueryAttention(
             d_model=config.d_model,
@@ -301,21 +312,11 @@ class MambaAttentionMoEBlock(nnx.Module):
         )
 
         # MoE stage after every mixer layer.
-        self.moe = SparseMoE(
-            d_model=config.d_model,
-            num_experts=config.num_experts,
-            num_shared_experts=config.num_shared_experts,
-            top_k=config.top_k,
-            expert_hidden_dim=config.expert_hidden_dim,
-            granularity_factor=config.granularity_factor,
-            scale_top_k_with_granularity=config.scale_top_k_with_granularity,
-            use_bias=False,
-            rngs=rngs,
-        )
+        self.moe = _build_moe(config=config, rngs=rngs)
 
     def __call__(
             self, x: jax.Array, return_aux_loss: bool = False
-    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+    ) -> BlockOutput:
         # Mamba residual path.
         x = x + self.mamba(self.norm_mamba(x))
 
@@ -323,16 +324,12 @@ class MambaAttentionMoEBlock(nnx.Module):
         x = x + self.attention(self.norm_attention(x))
 
         # MoE residual path.
-        if return_aux_loss:
-            moe_out, moe_aux_loss = self.moe(self.norm_moe(x), return_aux_loss=True)
-            x = x + moe_out
-            return x, moe_aux_loss
-
-        moe_out = self.moe(self.norm_moe(x), return_aux_loss=False)
-        if isinstance(moe_out, tuple):
-            raise RuntimeError("Expected SparseMoE to return only tensor output")
-        x = x + moe_out
-        return x
+        return _apply_moe_residual(
+            x=x,
+            norm_moe=self.norm_moe,
+            moe=self.moe,
+            return_aux_loss=return_aux_loss,
+        )
 
 
 class NemotronNanoLM(nnx.Module):
@@ -352,24 +349,22 @@ class NemotronNanoLM(nnx.Module):
 
         self.embedding = nnx.Embed(config.vocab_size, config.d_model, rngs=rngs)
         self.num_layers = 0
+        block_factories = {
+            "mamba_moe": MambaMoEBlock,
+            "mamba_attention_moe": MambaAttentionMoEBlock,
+        }
 
-        for i in range(len(config.patterns)):
-            if config.patterns[i][0] == "mamba_moe":
-                for j in range(config.patterns[i][1]):
+        for block_type, repeats in config.patterns:
+            block_factory = block_factories.get(block_type)
+            if block_factory is not None:
+                for offset in range(repeats):
                     setattr(
                         self,
-                        f"block_{self.num_layers + j}",
-                        MambaMoEBlock(config=config, rngs=rngs),
-                    )
-            elif config.patterns[i][0] == "mamba_attention_moe":
-                for j in range(config.patterns[i][1]):
-                    setattr(
-                        self,
-                        f"block_{self.num_layers + j}",
-                        MambaAttentionMoEBlock(config=config, rngs=rngs),
+                        f"block_{self.num_layers + offset}",
+                        block_factory(config=config, rngs=rngs),
                     )
 
-            self.num_layers += config.patterns[i][1]
+            self.num_layers += repeats
 
         self.final_norm = nnx.RMSNorm(config.d_model, rngs=rngs)
 
@@ -383,7 +378,7 @@ class NemotronNanoLM(nnx.Module):
 
     def __call__(
             self, token_ids: jax.Array, return_aux_loss: bool = False
-    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+    ) -> BlockOutput:
         x = self.embedding(token_ids)
         total_aux_loss = jnp.array(0.0, dtype=jnp.float32)
 
