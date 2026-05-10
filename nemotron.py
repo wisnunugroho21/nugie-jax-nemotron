@@ -46,14 +46,14 @@ class NemotronConfig:
     d_model: int = 128
 
     patterns: list[tuple[str, int]] = field(
-        default_factory=[
+        default_factory=lambda: [
             ("mamba_moe", 2),
             ("mamba_attention_moe", 1),
             ("mamba_moe", 2),
             ("mamba_attention_moe", 1),
             ("mamba_moe", 2),
             ("mamba_attention_moe", 1),
-            ("mamba_moe", 1)
+            ("mamba_moe", 1),
         ]
     )
 
@@ -251,7 +251,10 @@ class MambaMoEBlock(nnx.Module):
             x = x + moe_out
             return x, moe_aux_loss
 
-        x = x + self.moe(self.norm_moe(x), return_aux_loss=False)
+        moe_out = self.moe(self.norm_moe(x), return_aux_loss=False)
+        if isinstance(moe_out, tuple):
+            raise RuntimeError("Expected SparseMoE to return only tensor output")
+        x = x + moe_out
         return x
 
 
@@ -325,7 +328,10 @@ class MambaAttentionMoEBlock(nnx.Module):
             x = x + moe_out
             return x, moe_aux_loss
 
-        x = x + self.moe(self.norm_moe(x), return_aux_loss=False)
+        moe_out = self.moe(self.norm_moe(x), return_aux_loss=False)
+        if isinstance(moe_out, tuple):
+            raise RuntimeError("Expected SparseMoE to return only tensor output")
+        x = x + moe_out
         return x
 
 
