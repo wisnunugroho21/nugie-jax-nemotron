@@ -490,6 +490,28 @@ def chat_loop(
         # Keep only recent history so context stays bounded and simple.
         history = history[-1200:]
 
+def create_lr_schedule(max_steps: int, warmup_steps: int, peak_lr: float) -> optax.Schedule:
+    """
+    Creates a two-phase learning rate schedule:
+      Phase 1 (steps 0 .. warmup_steps):        linear ramp  0 → peak_lr
+      Phase 2 (steps warmup_steps .. max_steps): cosine decay peak_lr → 0
+
+    This avoids early training instability (warmup) while allowing the
+    optimizer to fine-tune at smaller learning rates later (cosine decay).
+    """
+    warmup = optax.linear_schedule(
+        init_value=0.0,
+        end_value=peak_lr,
+        transition_steps=warmup_steps,
+    )
+    decay = optax.cosine_decay_schedule(
+        init_value=peak_lr,
+        decay_steps=max(max_steps - warmup_steps, 1),
+    )
+    return optax.join_schedules(
+        schedules=[warmup, decay],
+        boundaries=[warmup_steps],
+    )
 
 def build_arg_parser() -> argparse.ArgumentParser:
     """CLI arguments kept intentionally small and beginner-friendly."""
@@ -543,6 +565,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional Hugging Face cache directory",
     )
     parser.add_argument(
+        "--preview-first-story",
+        action="store_true",
+        help="Print a short preview of the first loaded TinyStories sample",
+    )
+    parser.add_argument(
         "--skip-chat",
         action="store_true",
         help="Run train+eval only (useful for non-interactive testing)",
@@ -551,19 +578,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = build_arg_parser().parse_args()
-
     print("Initializing minimal Nemotron app...")
 
     # 1) Load real text data from TinyStories.
     all_stories = load_tinystories_texts(
-        max_stories=args.tinystories_max_stories,
-        split=args.tinystories_split,
-        cache_dir=args.tinystories_cache_dir,
+        max_stories=5000,
+        split="train",
+        cache_dir=None,
     )
     train_texts, val_texts = split_train_val_texts(
         stories=all_stories,
-        train_ratio=args.tinystories_train_ratio,
+        train_ratio=0.9,
     )
 
     print(
@@ -573,39 +598,60 @@ def main() -> None:
         f"val_stories={len(val_texts)}"
     )
 
+    # Optional preview: helps beginners see real input text before tokenization.
+    if True:
+        preview = all_stories[0].replace("\n", " ").strip()
+        preview_limit = 240
+        if len(preview) > preview_limit:
+            preview = preview[:preview_limit] + "..."
+
+        print("\nTinyStories preview (first loaded sample):")
+        print(f"  {preview}")
+
     # 2) Build tokenizer from dataset text.
     # We fit on all loaded stories so train and validation text are always encodable.
     tokenizer = CharTokenizer()
     tokenizer.fit(all_stories)
 
     # 3) Build Nemotron config/model.
-    config = NemotronConfig.from_preset(args.preset)
+    config = NemotronConfig.from_preset("tiny")
     config.vocab_size = tokenizer.vocab_size
 
-    if args.seq_len % config.mamba_chunk_size != 0:
-        raise ValueError(
-            f"seq_len must be divisible by mamba_chunk_size ({config.mamba_chunk_size})"
-        )
+    # if args.seq_len % config.mamba_chunk_size != 0:
+    #     raise ValueError(
+    #         f"seq_len must be divisible by mamba_chunk_size ({config.mamba_chunk_size})"
+    #     )
 
-    print(
-        "Model setup: "
-        f"preset={args.preset}, vocab_size={config.vocab_size}, "
-        f"seq_len={args.seq_len}, chunk_size={config.mamba_chunk_size}"
-    )
+    # print(
+    #     "Model setup: "
+    #     f"preset={args.preset}, vocab_size={config.vocab_size}, "
+    #     f"seq_len={args.seq_len}, chunk_size={config.mamba_chunk_size}"
+    # )
 
-    rngs = nnx.Rngs(args.seed)
+    rngs = nnx.Rngs(0)
     model = NemotronNanoBlock(rngs=rngs, config=config)
-    optimizer = nnx.Optimizer(model, optax.adamw(learning_rate=1e-3), wrt=nnx.Param)
+
+    # Build optimizer: AdamW with warmup + cosine decay
+    lr_schedule = create_lr_schedule(
+        max_steps=1000,
+        warmup_steps=200,
+        peak_lr=3e-4,
+    )
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=lr_schedule, weight_decay=0.1),
+    )
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     # Use a separate key stream for data/generation randomness.
-    rng_key = jax.random.PRNGKey(args.seed + 1)
+    rng_key = jax.random.PRNGKey(0 + 1)
 
     # 4) Prepare token streams from train/validation stories.
     train_tokens, val_tokens = prepare_datasets(
         tokenizer=tokenizer,
         train_texts=train_texts,
         val_texts=val_texts,
-        seq_len=args.seq_len,
+        seq_len=64,
     )
 
     # 5) Train.
@@ -614,9 +660,9 @@ def main() -> None:
         optimizer=optimizer,
         train_tokens=train_tokens,
         config=config,
-        steps=args.steps,
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
+        steps=100000,
+        batch_size=32,
+        seq_len=64,
         rng_key=rng_key,
     )
 
@@ -625,9 +671,9 @@ def main() -> None:
         model=model,
         val_tokens=val_tokens,
         config=config,
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        eval_batches=args.eval_batches,
+        batch_size=32,
+        seq_len=64,
+        eval_batches=32,
         rng_key=rng_key,
     )
 
@@ -637,13 +683,13 @@ def main() -> None:
     print(f"  perplexity:      {perplexity:.4f}")
 
     # 7) Chat.
-    if not args.skip_chat:
+    if not False:
         chat_loop(
             model=model,
             tokenizer=tokenizer,
-            seq_len=args.seq_len,
-            temperature=args.temperature,
-            max_new_tokens=args.max_new_tokens,
+            seq_len=64,
+            temperature=0.0,
+            max_new_tokens=200,
             rng_key=rng_key,
         )
 
