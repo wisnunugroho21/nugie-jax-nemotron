@@ -25,10 +25,14 @@ Key design choices from the paper:
 4. Squared-ReLU activation inside each expert FFN:
    relu(x)^2 — a stronger nonlinearity than plain ReLU.
 
-5. Standard GShard/Switch-style load-balancing auxiliary loss (Lepikhin et al. 2020):
-   Encourages tokens to be spread evenly across routed experts.
-   Uses raw sigmoid scores (not normalized) for the mean routing signal,
-   consistent with the independent-score nature of sigmoid gating.
+5. Aux-loss-free load balancing (Wang et al. 2024, as used in Nemotron 3 Nano §2.4):
+   Instead of an auxiliary gradient loss, each expert gets a learnable bias term.
+   The bias is added to routing scores at selection time, nudging the router toward
+   under-utilized experts — WITHOUT affecting the actual output gate weights.
+   After each training step, biases are updated with a simple sign rule:
+     if expert i got too many tokens → decrease its bias (harder to pick next time)
+     if expert i got too few tokens  → increase its bias (easier to pick next time)
+   The update rate is 1e-3 per the paper. This produces no extra gradient computation.
 
 6. No bias on any linear layers (per paper).
 
@@ -108,10 +112,20 @@ class SparseMoE(nnx.Module):
     With sigmoid: scores are independent; each expert is scored on its own merit.
     After top-k, selected scores are renormalized to sum to 1 for stable output scale.
 
-    --- Load-balancing auxiliary loss ---
-    Without regularization, the router learns to always pick a few "easy" experts
-    (expert collapse). The load-balancing loss penalizes this by rewarding
-    even token distribution across all routed experts.
+    --- Aux-loss-free load balancing ---
+    Without any balancing, the router collapses: it always picks a few favourite
+    experts and ignores the rest. The fix used in Nemotron 3 Nano is NOT a loss
+    term — instead, each expert gets a persistent bias scalar.
+
+    At routing time: top-k uses (sigmoid_score + expert_bias) to decide which
+    experts to activate. A higher bias makes an expert easier to pick.
+
+    At output time: gate weights use the ORIGINAL sigmoid scores (without bias),
+    so the learned expert magnitudes are preserved.
+
+    After every training step (outside the gradient): biases are nudged with a
+    simple sign update. Overloaded experts get a smaller bias; underloaded ones
+    get a larger bias. Over time this pushes the router toward balance.
 
     Args:
         granularity_factor:
@@ -120,6 +134,8 @@ class SparseMoE(nnx.Module):
         scale_top_k_with_granularity:
             True (default): effective top-k = top_k * granularity_factor.
             False: keep top-k fixed regardless of granularity.
+        bias_update_rate:
+            Step size for the expert bias update. 1e-3 per Nemotron 3 Nano §2.4.
     """
 
     def __init__(
@@ -133,6 +149,7 @@ class SparseMoE(nnx.Module):
         use_bias: bool = False,
         granularity_factor: int = 1,
         scale_top_k_with_granularity: bool = True,
+        bias_update_rate: float = 1e-3,  # Wang et al. 2024 / Nemotron 3 Nano §2.4
     ):
         self.d_model = d_model
 
@@ -175,6 +192,16 @@ class SparseMoE(nnx.Module):
         # Shared experts keep the full hidden dimension.
         # They're meant to model general token features, so they stay large.
         self.shared_expert_hidden_dim = self.expert_hidden_dim
+
+        # Step size used when updating expert biases after each training step.
+        self.bias_update_rate = bias_update_rate
+
+        # Expert bias for aux-loss-free load balancing.
+        # Shape: (num_routed_experts,), initialized to 0 for all experts equally.
+        # NOT updated by the gradient optimizer — updated manually via update_expert_bias().
+        # Stored as a plain nnx.Variable (not nnx.Param) so it can be filtered out
+        # of gradient updates when extracting model parameters.
+        self.expert_bias = nnx.Variable(jnp.zeros(self.num_routed_experts))
 
         # Router: a single linear layer mapping each token to one logit per routed expert.
         # No bias per paper. Shared experts are NOT routed — they bypass this.
@@ -252,62 +279,52 @@ class SparseMoE(nnx.Module):
             outputs.append(expert(x_flat))
         return jnp.stack(outputs, axis=1)
 
-    def _load_balancing_aux_loss(
-        self, routed_scores: jax.Array, topk_indices: jax.Array
-    ) -> jax.Array:
+    def update_expert_bias(self, topk_indices: jax.Array) -> None:
         """
-        Standard GShard/Switch-style load-balancing auxiliary loss (Lepikhin et al. 2020).
+        Update the expert bias after each training step.
 
-        Without this loss the router tends to collapse: it repeatedly picks a small
-        set of "easy" experts while the rest are never used (expert collapse).
+        This is the core of the aux-loss-free load balancing strategy
+        (Wang et al. 2024), as used in Nemotron 3 Nano (§2.4).
 
-        The loss encourages balance by penalizing the combination of:
-          - dispatch_fraction[i]: the fraction of tokens actually routed to expert i
-          - mean_routing_score[i]: the average sigmoid score the router assigns to expert i
+        The idea is simple:
+          - Count how many tokens each expert received in this step.
+          - Compare to the ideal uniform count (tokens * top_k / num_experts).
+          - Decrease the bias of overloaded experts so they win fewer top-k races.
+          - Increase the bias of underloaded experts so they win more top-k races.
 
-        If expert i is used a lot AND the router rates it highly, both terms are large,
-        producing a large loss. Minimizing this pushes the router to spread tokens out.
+        The update uses sign() instead of the actual count difference, so the
+        step size is always exactly +/- bias_update_rate regardless of how far
+        off-balance the expert is. This keeps the bias values small and stable.
 
-        Formula (Lepikhin et al. 2020 / Switch Transformer):
-            L_balance = num_experts * sum_i( dispatch_fraction_i * mean_routing_score_i )
-
-        Important: we use the raw sigmoid scores (not normalized) for mean_routing_score.
-        Nemotron 3 Nano uses sigmoid gating where each expert score is independent.
-        Normalizing the scores (e.g. dividing by their sum) would create an artificial
-        softmax-like distribution that misrepresents how sigmoid routing actually works.
+        IMPORTANT: Call this AFTER the optimizer step, outside the gradient tape.
+        The expert_bias is NOT a gradient parameter — it must not be passed to
+        the optimizer. Filter it out by type when building the optimizer state.
 
         Args:
-            routed_scores: sigmoid scores for all routed experts,
-                           shape (num_tokens, num_routed_experts)
-            topk_indices:  indices of the selected top-k experts per token,
-                           shape (num_tokens, routed_top_k)
-        Returns:
-            aux_loss: scalar
+            topk_indices: (num_tokens, routed_top_k) from the last forward pass.
+                          These are the expert indices that were selected.
         """
-        num_tokens = routed_scores.shape[0]
+        num_tokens = topk_indices.shape[0]
 
-        # Build a binary dispatch mask: dispatch_mask[t, i] = 1 if token t
-        # was routed to expert i, 0 otherwise.
-        dispatch_mask = jnp.zeros_like(routed_scores)
-        token_ids = jnp.arange(num_tokens)[:, None]
-        dispatch_mask = dispatch_mask.at[token_ids, topk_indices].set(1.0)
-
-        # dispatch_fraction[i] = fraction of routing slots going to expert i.
-        # Dividing by routed_top_k ensures the fractions sum to 1.0 over all experts.
-        # (Each token contributes 1/routed_top_k to each of its top-k experts.)
-        dispatch_fraction = jnp.mean(dispatch_mask / self.routed_top_k, axis=0)
-
-        # mean_routing_score[i] = average sigmoid score assigned to expert i across tokens.
-        # We use the raw sigmoid scores directly — they reflect the router's independent
-        # judgment of each expert, without any cross-expert normalization.
-        mean_routing_score = jnp.mean(routed_scores, axis=0)
-
-        # Scale by num_experts so the loss magnitude stays roughly constant
-        # regardless of how many experts there are.
-        aux_loss = self.num_routed_experts * jnp.sum(
-            dispatch_fraction * mean_routing_score
+        # Count how many tokens were routed to each expert.
+        # one_hot: (num_tokens, routed_top_k, num_routed_experts)
+        # sum over (tokens, top_k slots) → (num_routed_experts,)
+        actual_count = jnp.sum(
+            jax.nn.one_hot(topk_indices, self.num_routed_experts),
+            axis=(0, 1),
         )
-        return aux_loss
+
+        # The ideal count if all experts were equally loaded.
+        expected_count = num_tokens * self.routed_top_k / self.num_routed_experts
+
+        # sign(actual - expected):
+        #   +1 means overloaded  → subtract from bias → harder to pick next time
+        #   -1 means underloaded → add to bias        → easier to pick next time
+        #    0 means perfect     → no change
+        self.expert_bias.value = (
+            self.expert_bias.value
+            - self.bias_update_rate * jnp.sign(actual_count - expected_count)
+        )
 
     def __call__(
         self, x: jax.Array, return_aux_loss: bool = False
@@ -315,22 +332,27 @@ class SparseMoE(nnx.Module):
         """
         Forward pass through the sparse MoE layer.
 
-        Overview:
-            1. Router assigns one sigmoid score per routed expert, per token.
-            2. Top-k selection picks the best k routed experts for each token.
-            3. Selected sigmoid scores are renormalized to sum to 1 (output scale stability).
-            4. Weighted sum of selected expert outputs forms the routed path.
-            5. All shared experts run unconditionally; their outputs are summed.
-            6. Routed path + shared path = final output.
+        Routing overview (aux-loss-free approach):
+            1. Router produces one sigmoid score per expert, per token.
+            2. Expert bias is ADDED to scores for top-k selection only.
+               This steers the router toward under-utilized experts.
+            3. Top-k selection uses the biased scores to choose which experts run.
+            4. Gate weights use the ORIGINAL (unbiased) sigmoid scores, renormalized.
+               The bias is a routing hint, not a magnitude signal.
+            5. Weighted sum of selected expert outputs forms the routed path.
+            6. All shared experts run unconditionally; their outputs are summed in.
+
+        To balance load: call update_expert_bias(topk_indices) after each training step.
 
         Args:
             x: (batch, seqlen, d_model)
-            return_aux_loss: if True, also return the load-balancing auxiliary loss.
-                             Pass this loss coefficient * aux_loss to the optimizer.
+            return_aux_loss: kept for API compatibility with nemotron.py.
+                             Always returns 0.0 — balancing is done via expert_bias,
+                             not a gradient loss term.
 
         Returns:
             y: (batch, seqlen, d_model)
-            aux_loss (optional): scalar — only returned when return_aux_loss=True
+            jnp.zeros(()) (optional): only returned when return_aux_loss=True
         """
         batch, seqlen, d_model = x.shape
         assert d_model == self.d_model, "Input d_model does not match MoE config"
@@ -346,52 +368,54 @@ class SparseMoE(nnx.Module):
 
         # Step 2: Apply sigmoid to get independent gate scores.
         # Unlike softmax, sigmoid does NOT create a probability distribution.
-        # Each expert's score is judged independently; scores do not sum to 1.
-        # This is the "sigmoid gating" described in the Nemotron 3 Nano paper.
+        # Each expert's score is judged independently — scores do not compete.
         routed_scores = jax.nn.sigmoid(routed_logits)  # (num_tokens, num_routed_experts)
 
-        # Step 3: Select the top-k experts for each token.
-        # topk_values:  (num_tokens, routed_top_k) — their sigmoid scores
-        # topk_indices: (num_tokens, routed_top_k) — which expert indices were chosen
-        topk_values, topk_indices = jax.lax.top_k(routed_scores, self.routed_top_k)
+        # Step 3 (aux-loss-free): Add the expert bias to scores before top-k selection.
+        # The bias is learned over time: underloaded experts accumulate a positive bias
+        # (making them easier to pick), overloaded experts accumulate a negative bias
+        # (making them harder to pick). This is the key load-balancing mechanism.
+        # expert_bias shape: (num_routed_experts,) → broadcasts across all tokens.
+        biased_scores = routed_scores + self.expert_bias.value
 
-        # Step 4: Build a sparse gate matrix of shape (num_tokens, num_routed_experts).
-        # Non-selected experts get gate=0; selected experts get their sigmoid score.
+        # Step 4: Select top-k experts using BIASED scores.
+        # We use biased scores here so the selection reflects the desired load balance.
+        # topk_indices: (num_tokens, routed_top_k) — which expert indices were chosen
+        _, topk_indices = jax.lax.top_k(biased_scores, self.routed_top_k)
+
+        # Step 5: Build gate weights using the ORIGINAL (unbiased) sigmoid scores.
+        # The bias only determines WHO gets selected, not HOW MUCH they contribute.
+        # Using original scores preserves the expert's learned signal magnitude.
         token_ids = jnp.arange(num_tokens)[:, None]
         routed_gates = jnp.zeros_like(routed_scores)
-        routed_gates = routed_gates.at[token_ids, topk_indices].set(topk_values)
+        routed_gates = routed_gates.at[token_ids, topk_indices].set(
+            routed_scores[token_ids, topk_indices]  # original scores, not biased
+        )
 
-        # Step 5: Renormalize the selected gates so they sum to 1 per token.
-        # Because sigmoid scores are unbounded and independent, their sum can vary.
-        # Renormalizing gives a stable output scale similar to softmax weighting.
-        # Non-selected experts stay at 0, so only the top-k values are affected.
+        # Step 6: Renormalize the selected gates so they sum to 1 per token.
+        # This keeps the output scale stable regardless of the absolute score values.
+        # Non-selected experts (gate=0) are unaffected.
         routed_gates = routed_gates / (
             jnp.sum(routed_gates, axis=-1, keepdims=True) + 1e-6
         )
 
-        # Compute the load-balancing loss from raw scores (before renormalization).
-        # This is used only during training to encourage even expert utilization.
-        aux_loss = self._load_balancing_aux_loss(routed_scores, topk_indices)
-
-        # Step 6: Run all routed experts and compute the gated weighted sum.
+        # Step 7: Run all routed experts and compute the gated weighted sum.
         # routed_outputs: (num_tokens, num_routed_experts, d_model)
         routed_outputs = self._collect_routed_outputs(x_flat)
 
         # routed_gates[:, :, None] broadcasts to (num_tokens, num_routed_experts, d_model).
-        # Summing over the expert dimension gives the combined routed output.
-        # Non-selected experts (gate=0) contribute nothing.
+        # Non-selected experts (gate=0) contribute nothing to the sum.
         routed_mix = jnp.sum(routed_outputs * routed_gates[:, :, None], axis=1)
         # routed_mix: (num_tokens, d_model)
 
         # ── Shared path ─────────────────────────────────────────────────────────
 
         if self.num_shared_experts > 0:
-            # Run all shared experts on all tokens — no routing, always active.
+            # Shared experts run on every token with no gating or selection.
             shared_outputs = self._collect_shared_outputs(x_flat)
             # shared_outputs: (num_tokens, num_shared_experts, d_model)
 
             # Sum across shared experts: each expert adds its own contribution.
-            # Summing (not averaging) means multiple shared experts act as an ensemble.
             shared_mix = jnp.sum(shared_outputs, axis=1)  # (num_tokens, d_model)
 
             # Final output = routed path + shared path.
@@ -403,5 +427,7 @@ class SparseMoE(nnx.Module):
         y = jnp.reshape(y_flat, (batch, seqlen, d_model))
 
         if return_aux_loss:
-            return y, aux_loss
+            # No gradient-based aux loss with aux-loss-free balancing.
+            # Load balancing is handled by update_expert_bias() called after training.
+            return y, jnp.zeros(())
         return y
