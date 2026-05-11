@@ -2,9 +2,10 @@
 Simple, minimal, and explainable Nemotron app.
 
 This script shows a full small workflow:
-1) Train a tiny Nemotron language model
-2) Evaluate it with validation loss + perplexity
-3) Chat with it in the terminal
+1) Load a real dataset (roneneldan/TinyStories)
+2) Train a tiny Nemotron language model
+3) Evaluate it with validation loss + perplexity
+4) Chat with it in the terminal
 
 Design goals:
 - Keep code easy to read and modify.
@@ -95,22 +96,97 @@ class CharTokenizer:
         return "".join(chars)
 
 
-def build_tiny_corpus() -> list[str]:
+def _extract_story_text(example: dict[str, object]) -> str:
     """
-    Returns a tiny toy corpus.
+    Reads one TinyStories row and returns its text.
 
-    The text is intentionally small and repetitive so the model can learn
-    simple patterns quickly in a local demo run.
+    We check a few keys defensively so this stays easy to understand even if
+    the upstream schema changes slightly.
     """
-    return [
-        "User: hello\nAssistant: hello, how can I help you today?\n",
-        "User: what is your name?\nAssistant: I am a tiny Nemotron demo model.\n",
-        "User: what can you do?\nAssistant: I can answer simple questions in this toy demo.\n",
-        "User: explain ai\nAssistant: AI is software that learns patterns from data.\n",
-        "User: what is jax\nAssistant: JAX is a Python library for fast numerical computing.\n",
-        "User: thanks\nAssistant: you are welcome.\n",
-        "User: bye\nAssistant: goodbye.\n",
-    ]
+    for key in ("text", "story", "content"):
+        value = example.get(key)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def load_tinystories_texts(
+    max_stories: int,
+    split: str = "train",
+    cache_dir: str | None = None,
+) -> list[str]:
+    """
+    Loads a bounded number of stories from roneneldan/TinyStories.
+
+    Why a bounded subset?
+    - Keeps the demo easy to run locally.
+    - Keeps the data flow simple and inspectable.
+    - Streams rows and stops early at `max_stories`.
+    """
+    if max_stories < 2:
+        raise ValueError("max_stories must be at least 2")
+
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "TinyStories training requires the 'datasets' package. "
+            "Install it with: pip install datasets"
+        ) from exc
+
+    try:
+        dataset = load_dataset(
+            "roneneldan/TinyStories",
+            split=split,
+            cache_dir=cache_dir,
+            streaming=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load roneneldan/TinyStories. "
+            "Check your internet connection and cache permissions."
+        ) from exc
+
+    stories: list[str] = []
+
+    # Intentionally iterate in plain Python for readability.
+    for example in dataset:
+        story = _extract_story_text(example)
+        if story:
+            stories.append(story)
+        if len(stories) >= max_stories:
+            break
+
+    if len(stories) < 2:
+        raise ValueError("TinyStories did not return enough non-empty stories")
+
+    return stories
+
+
+def split_train_val_texts(
+    stories: list[str],
+    train_ratio: float,
+) -> tuple[list[str], list[str]]:
+    """
+    Splits stories into train and validation lists.
+
+    This uses a deterministic ordered split to keep behavior simple and
+    reproducible.
+    """
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError("train_ratio must be between 0 and 1")
+    if len(stories) < 2:
+        raise ValueError("Need at least 2 stories for train/validation split")
+
+    split_index = int(len(stories) * train_ratio)
+    split_index = max(1, split_index)
+    split_index = min(split_index, len(stories) - 1)
+
+    train_texts = stories[:split_index]
+    val_texts = stories[split_index:]
+    return train_texts, val_texts
 
 
 def cross_entropy_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
@@ -144,26 +220,31 @@ def _ensure_min_length(tokens: jax.Array, min_length: int) -> jax.Array:
 
 
 def prepare_datasets(
-    tokenizer: CharTokenizer, seq_len: int
+    tokenizer: CharTokenizer,
+    train_texts: list[str],
+    val_texts: list[str],
+    seq_len: int,
 ) -> tuple[jax.Array, jax.Array]:
     """
-    Creates train/val token streams from a tiny corpus.
+    Creates train/val token streams from TinyStories text.
 
     Output format:
     - train_tokens: shape (num_train_tokens,)
     - val_tokens: shape (num_val_tokens,)
     """
-    corpus = build_tiny_corpus()
-    joined = "".join(corpus)
+    if not train_texts or not val_texts:
+        raise ValueError("train_texts and val_texts must both be non-empty")
+
+    # Keep train/validation streams separate so evaluation stays honest.
+    train_joined = "\n\n".join(train_texts)
+    val_joined = "\n\n".join(val_texts)
 
     # Add BOS/EOS so the model can learn sequence boundaries.
-    all_ids = tokenizer.encode(joined, add_bos=True, add_eos=True)
-    all_tokens = jnp.array(all_ids, dtype=jnp.int32)
+    train_ids = tokenizer.encode(train_joined, add_bos=True, add_eos=True)
+    val_ids = tokenizer.encode(val_joined, add_bos=True, add_eos=True)
 
-    # Keep validation split small but non-empty.
-    split = max(2, int(0.9 * int(all_tokens.shape[0])))
-    train_tokens = all_tokens[:split]
-    val_tokens = all_tokens[split:]
+    train_tokens = jnp.array(train_ids, dtype=jnp.int32)
+    val_tokens = jnp.array(val_ids, dtype=jnp.int32)
 
     # Ensure both splits are large enough to sample (x, y) windows.
     min_stream_len = seq_len + 2
@@ -438,6 +519,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument(
+        "--tinystories-max-stories",
+        type=int,
+        default=5000,
+        help="How many TinyStories stories to load for this run",
+    )
+    parser.add_argument(
+        "--tinystories-train-ratio",
+        type=float,
+        default=0.9,
+        help="Fraction of stories used for training (rest for validation)",
+    )
+    parser.add_argument(
+        "--tinystories-split",
+        type=str,
+        default="train",
+        help="Hugging Face split to read from TinyStories",
+    )
+    parser.add_argument(
+        "--tinystories-cache-dir",
+        type=str,
+        default=None,
+        help="Optional Hugging Face cache directory",
+    )
+    parser.add_argument(
         "--skip-chat",
         action="store_true",
         help="Run train+eval only (useful for non-interactive testing)",
@@ -450,11 +555,30 @@ def main() -> None:
 
     print("Initializing minimal Nemotron app...")
 
-    # 1) Build tokenizer and tiny text data.
-    tokenizer = CharTokenizer()
-    tokenizer.fit(build_tiny_corpus())
+    # 1) Load real text data from TinyStories.
+    all_stories = load_tinystories_texts(
+        max_stories=args.tinystories_max_stories,
+        split=args.tinystories_split,
+        cache_dir=args.tinystories_cache_dir,
+    )
+    train_texts, val_texts = split_train_val_texts(
+        stories=all_stories,
+        train_ratio=args.tinystories_train_ratio,
+    )
 
-    # 2) Build Nemotron config/model.
+    print(
+        "Dataset setup: "
+        f"total_stories={len(all_stories)}, "
+        f"train_stories={len(train_texts)}, "
+        f"val_stories={len(val_texts)}"
+    )
+
+    # 2) Build tokenizer from dataset text.
+    # We fit on all loaded stories so train and validation text are always encodable.
+    tokenizer = CharTokenizer()
+    tokenizer.fit(all_stories)
+
+    # 3) Build Nemotron config/model.
     config = NemotronConfig.from_preset(args.preset)
     config.vocab_size = tokenizer.vocab_size
 
@@ -476,10 +600,15 @@ def main() -> None:
     # Use a separate key stream for data/generation randomness.
     rng_key = jax.random.PRNGKey(args.seed + 1)
 
-    # 3) Prepare dataset.
-    train_tokens, val_tokens = prepare_datasets(tokenizer, args.seq_len)
+    # 4) Prepare token streams from train/validation stories.
+    train_tokens, val_tokens = prepare_datasets(
+        tokenizer=tokenizer,
+        train_texts=train_texts,
+        val_texts=val_texts,
+        seq_len=args.seq_len,
+    )
 
-    # 4) Train.
+    # 5) Train.
     rng_key = train_model(
         model=model,
         optimizer=optimizer,
@@ -491,7 +620,7 @@ def main() -> None:
         rng_key=rng_key,
     )
 
-    # 5) Evaluate.
+    # 6) Evaluate.
     mean_total, mean_ce, perplexity, rng_key = evaluate_model(
         model=model,
         val_tokens=val_tokens,
@@ -507,7 +636,7 @@ def main() -> None:
     print(f"  mean CE loss:    {mean_ce:.4f}")
     print(f"  perplexity:      {perplexity:.4f}")
 
-    # 5) Chat.
+    # 7) Chat.
     if not args.skip_chat:
         chat_loop(
             model=model,
