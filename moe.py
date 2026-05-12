@@ -252,11 +252,13 @@ class SparseMoE(nnx.Module):
         topk_indices: jax.Array,
     ) -> jax.Array:
         """
-        Run only selected routed experts and dispatch in larger expert batches.
+        Run only the selected routed experts via stacked-weight gather + einsum.
 
-        We flatten (token, selected_expert) assignments, sort them by expert ID,
-        and then process contiguous runs with buffered expert calls. This keeps
-        selected-only behavior while reducing tiny one-token expert invocations.
+        All expert fc1/fc2 kernels are stacked into batched tensors once, then
+        we index with topk_indices to gather only the K selected experts' weights
+        per token. The expert MLPs are applied with two einsums — no loop, no
+        lax.switch, no buffer logic. Only (num_tokens × routed_top_k) expert
+        forward passes are computed; non-selected experts are never touched.
 
         Args:
             x_flat: (num_tokens, d_model)
@@ -266,146 +268,51 @@ class SparseMoE(nnx.Module):
                             with zeros for non-selected expert/token pairs.
         """
         num_tokens = x_flat.shape[0]
+
+        # Stack every routed expert's fc1 and fc2 kernels into batched arrays.
+        # Indexing axis-0 of W1/W2 gives one expert's weight matrix.
+        # W1: (num_routed_experts, d_model,      routed_expert_hidden_dim)
+        # W2: (num_routed_experts, routed_expert_hidden_dim, d_model)
+        W1 = jnp.stack(
+            [getattr(self, f"routed_expert_{i}").fc1.kernel.value
+             for i in range(self.num_routed_experts)],
+            axis=0,
+        )
+        W2 = jnp.stack(
+            [getattr(self, f"routed_expert_{i}").fc2.kernel.value
+             for i in range(self.num_routed_experts)],
+            axis=0,
+        )
+
+        # Gather only the weights of each token's top-k selected experts.
+        # topk_indices: (num_tokens, routed_top_k)  →  index into axis-0 of W1/W2
+        # W1_sel: (num_tokens, routed_top_k, d_model,      hidden_dim)
+        # W2_sel: (num_tokens, routed_top_k, hidden_dim,   d_model)
+        W1_sel = W1[topk_indices]
+        W2_sel = W2[topk_indices]
+
+        # fc1: apply each token's K selected up-projections simultaneously.
+        # 't d, t k d h -> t k h'  means: for every token t and selected expert k,
+        # dot x_flat[t] with W1_sel[t, k] to get a hidden vector of size h.
+        h = jnp.einsum("td,tkdh->tkh", x_flat, W1_sel)
+
+        # Squared-ReLU activation: relu(x)^2  (paper §2.1 / MoEExpert.__call__).
+        h = jax.nn.relu(h)
+        h = h * h
+
+        # fc2: apply each token's K selected down-projections.
+        # 't k h, t k h d -> t k d'  projects hidden vectors back to d_model.
+        out = jnp.einsum("tkh,tkhd->tkd", h, W2_sel)
+        # out: (num_tokens, routed_top_k, d_model) — only selected expert outputs
+
+        # Scatter the K outputs into the full (num_tokens, num_routed_experts, d_model)
+        # tensor. Non-selected (token, expert) slots remain zero.
         routed_outputs = jnp.zeros(
             (num_tokens, self.num_routed_experts, self.d_model), dtype=x_flat.dtype
         )
+        token_ids = jnp.arange(num_tokens)[:, None]  # (num_tokens, 1), broadcasts over K
+        routed_outputs = routed_outputs.at[token_ids, topk_indices].set(out)
 
-        # Flatten token->expert assignments from top-k routing.
-        total_assignments = num_tokens * self.routed_top_k
-        token_ids = jnp.repeat(
-            jnp.arange(num_tokens, dtype=jnp.int32), self.routed_top_k
-        )
-        selected_experts = jnp.reshape(topk_indices, (total_assignments,))
-
-        # Group assignments by expert so each expert can run on larger token batches.
-        sort_order = jnp.argsort(selected_experts)
-        sorted_token_ids = token_ids[sort_order]
-        sorted_experts = selected_experts[sort_order]
-        sorted_tokens = x_flat[sorted_token_ids]
-
-        # Buffer size targets the expected average routed load per expert.
-        avg_tokens_per_expert = (
-            total_assignments + self.num_routed_experts - 1
-        ) // self.num_routed_experts
-        dispatch_batch_size = max(1, min(num_tokens, max(8, avg_tokens_per_expert)))
-
-        # One branch per routed expert; each branch runs the full expert batch.
-        expert_batch_fns = tuple(
-            (
-                lambda tokens, expert=getattr(self, f"routed_expert_{i}"): expert(
-                    tokens
-                )
-            )
-            for i in range(self.num_routed_experts)
-        )
-
-        valid_positions = jnp.arange(dispatch_batch_size, dtype=jnp.int32)
-
-        def flush_buffer(
-            outputs: jax.Array,
-            buf_tokens: jax.Array,
-            buf_token_ids: jax.Array,
-            buf_expert_id: jax.Array,
-            buf_len: jax.Array,
-        ) -> jax.Array:
-            def do_flush(args: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]):
-                outputs_, buf_tokens_, buf_token_ids_, buf_expert_id_, buf_len_ = args
-                buf_out = jax.lax.switch(buf_expert_id_, expert_batch_fns, buf_tokens_)
-                valid = valid_positions < buf_len_
-                buf_out = jnp.where(valid[:, None], buf_out, 0)
-                return outputs_.at[buf_token_ids_, buf_expert_id_].add(buf_out)
-
-            return jax.lax.cond(
-                buf_len > 0,
-                do_flush,
-                lambda args: args[0],
-                (outputs, buf_tokens, buf_token_ids, buf_expert_id, buf_len),
-            )
-
-        def run_selected(
-            carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
-            inputs: tuple[jax.Array, jax.Array, jax.Array],
-        ):
-            outputs, buf_tokens, buf_token_ids, buf_expert_id, buf_len = carry
-            token_id, expert_id, token_vec = inputs
-
-            can_append = (buf_len > 0) & (expert_id == buf_expert_id) & (
-                buf_len < dispatch_batch_size
-            )
-
-            def append_to_buffer(
-                state: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
-            ):
-                outputs_, buf_tokens_, buf_token_ids_, buf_expert_id_, buf_len_ = state
-                buf_tokens_ = buf_tokens_.at[buf_len_].set(token_vec)
-                buf_token_ids_ = buf_token_ids_.at[buf_len_].set(token_id)
-                return (
-                    outputs_,
-                    buf_tokens_,
-                    buf_token_ids_,
-                    buf_expert_id_,
-                    buf_len_ + 1,
-                )
-
-            def flush_and_restart(
-                state: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
-            ):
-                outputs_, buf_tokens_, buf_token_ids_, buf_expert_id_, buf_len_ = state
-                outputs_ = flush_buffer(
-                    outputs_,
-                    buf_tokens_,
-                    buf_token_ids_,
-                    buf_expert_id_,
-                    buf_len_,
-                )
-                new_buf_tokens = jnp.zeros_like(buf_tokens_)
-                new_buf_token_ids = jnp.zeros_like(buf_token_ids_)
-                new_buf_tokens = new_buf_tokens.at[0].set(token_vec)
-                new_buf_token_ids = new_buf_token_ids.at[0].set(token_id)
-                return (
-                    outputs_,
-                    new_buf_tokens,
-                    new_buf_token_ids,
-                    expert_id,
-                    jnp.array(1, dtype=jnp.int32),
-                )
-
-            next_carry = jax.lax.cond(
-                can_append,
-                append_to_buffer,
-                flush_and_restart,
-                (outputs, buf_tokens, buf_token_ids, buf_expert_id, buf_len),
-            )
-            return next_carry, None
-
-        init_buf_tokens = jnp.zeros(
-            (dispatch_batch_size, self.d_model), dtype=x_flat.dtype
-        )
-        init_buf_token_ids = jnp.zeros((dispatch_batch_size,), dtype=jnp.int32)
-        init_buf_expert_id = jnp.array(0, dtype=jnp.int32)
-        init_buf_len = jnp.array(0, dtype=jnp.int32)
-
-        (routed_outputs, buf_tokens, buf_token_ids, buf_expert_id, buf_len), _ = (
-            jax.lax.scan(
-                run_selected,
-                (
-                    routed_outputs,
-                    init_buf_tokens,
-                    init_buf_token_ids,
-                    init_buf_expert_id,
-                    init_buf_len,
-                ),
-                (sorted_token_ids, sorted_experts, sorted_tokens),
-            )
-        )
-
-        routed_outputs = flush_buffer(
-            routed_outputs,
-            buf_tokens,
-            buf_token_ids,
-            buf_expert_id,
-            buf_len,
-        )
         return routed_outputs
 
     def _collect_shared_outputs(self, x_flat: jax.Array) -> jax.Array:
