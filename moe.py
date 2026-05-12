@@ -220,11 +220,9 @@ class SparseMoE(nnx.Module):
             x_flat: (num_tokens, d_model)
             topk_indices: (num_tokens, routed_top_k)
         Returns:
-            routed_outputs: (num_tokens, num_routed_experts, d_model)
-                            with zeros for non-selected expert/token pairs.
+            routed_outputs: (num_tokens, routed_top_k, d_model)
+                            only the selected expert outputs, in top-k order.
         """
-        num_tokens = x_flat.shape[0]
-
         # Weights are pre-stacked at init time — no assembly cost here.
         # W1: (num_routed_experts, d_model,      routed_expert_hidden_dim)
         # W2: (num_routed_experts, routed_expert_hidden_dim, d_model)
@@ -250,17 +248,8 @@ class SparseMoE(nnx.Module):
         # fc2: apply each token's K selected down-projections.
         # 't k h, t k h d -> t k d'  projects hidden vectors back to d_model.
         out = jnp.einsum("tkh,tkhd->tkd", h, W2_sel)
-        # out: (num_tokens, routed_top_k, d_model) — only selected expert outputs
-
-        # Scatter the K outputs into the full (num_tokens, num_routed_experts, d_model)
-        # tensor. Non-selected (token, expert) slots remain zero.
-        routed_outputs = jnp.zeros(
-            (num_tokens, self.num_routed_experts, self.d_model), dtype=x_flat.dtype
-        )
-        token_ids = jnp.arange(num_tokens)[:, None]  # (num_tokens, 1), broadcasts over K
-        routed_outputs = routed_outputs.at[token_ids, topk_indices].set(out)
-
-        return routed_outputs
+        # out: (num_tokens, routed_top_k, d_model)
+        return out
 
     def _collect_shared_outputs(self, x_flat: jax.Array) -> jax.Array:
         """
@@ -398,26 +387,23 @@ class SparseMoE(nnx.Module):
         # Step 5: Build gate weights using the ORIGINAL (unbiased) sigmoid scores.
         # The bias only determines WHO gets selected, not HOW MUCH they contribute.
         # Using original scores preserves the expert's learned signal magnitude.
-        token_ids = jnp.arange(num_tokens)[:, None]
-        routed_gates = jnp.zeros_like(routed_scores)
-        routed_gates = routed_gates.at[token_ids, topk_indices].set(
-            routed_scores[token_ids, topk_indices]  # original scores, not biased
-        )
+        # Gather only the top-k scores — no need to build a full (num_tokens, num_routed_experts) tensor.
+        token_ids = jnp.arange(num_tokens)[:, None]  # (num_tokens, 1)
+        selected_scores = routed_scores[token_ids, topk_indices]  # (num_tokens, routed_top_k)
 
-        # Step 6: Renormalize the selected gates so they sum to 1 per token.
+        # Step 6: Renormalize so selected gate weights sum to 1 per token.
         # This keeps the output scale stable regardless of the absolute score values.
-        # Non-selected experts (gate=0) are unaffected.
-        routed_gates = routed_gates / (
-            jnp.sum(routed_gates, axis=-1, keepdims=True) + 1e-6
-        )
+        selected_gates = selected_scores / (
+            jnp.sum(selected_scores, axis=-1, keepdims=True) + 1e-6
+        )  # (num_tokens, routed_top_k)
 
         # Step 7: Run only selected routed experts and compute the gated weighted sum.
-        # routed_outputs: (num_tokens, num_routed_experts, d_model)
+        # routed_outputs: (num_tokens, routed_top_k, d_model) — already only top-k, no zeros padding.
         routed_outputs = self._collect_routed_outputs(x_flat, topk_indices)
 
-        # routed_gates[:, :, None] broadcasts to (num_tokens, num_routed_experts, d_model).
-        # Non-selected experts (gate=0) contribute nothing to the sum.
-        routed_mix = jnp.sum(routed_outputs * routed_gates[:, :, None], axis=1)
+        # selected_gates[:, :, None] broadcasts to (num_tokens, routed_top_k, d_model).
+        routed_mix = jnp.sum(routed_outputs * selected_gates[:, :, None], axis=1)
+        # routed_mix: (num_tokens, d_model)
         # routed_mix: (num_tokens, d_model)
 
         # ── Shared path ─────────────────────────────────────────────────────────

@@ -298,23 +298,19 @@ class NemotronNanoBlock(nnx.Module):
         self.config = config
 
         self.embedding = nnx.Embed(config.vocab_size, config.d_model, rngs=rngs)
-        self.num_layers = 0
         block_factories = {
             "mamba_moe": MambaMoEBlock,
             "mamba_attention_moe": MambaAttentionMoEBlock,
         }
 
+        blocks: list[MambaMoEBlock | MambaAttentionMoEBlock] = []
         for block_type, repeats in config.patterns:
             block_factory = block_factories.get(block_type)
-            if block_factory is not None:
-                for offset in range(repeats):
-                    setattr(
-                        self,
-                        f"block_{self.num_layers + offset}",
-                        block_factory(config=config, rngs=rngs),
-                    )
-
-            self.num_layers += repeats
+            if block_factory is None:
+                raise ValueError(f"Unknown block type '{block_type}'")
+            for _ in range(repeats):
+                blocks.append(block_factory(config=config, rngs=rngs))
+        self.blocks = blocks
 
         self.final_norm = nnx.RMSNorm(config.d_model, rngs=rngs)
 
@@ -329,8 +325,7 @@ class NemotronNanoBlock(nnx.Module):
     def __call__(self, token_ids: jax.Array) -> jax.Array:
         x = self.embedding(token_ids)
 
-        for i in range(self.num_layers):
-            block = getattr(self, f"block_{i}")
+        for block in self.blocks:
             x = block(x)
 
         x = self.final_norm(x)

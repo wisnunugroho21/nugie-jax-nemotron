@@ -195,16 +195,6 @@ def cross_entropy_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
     return optax.softmax_cross_entropy(logits, one_hot).mean()
 
 
-def total_training_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
-    """
-    Training loss used for Nemotron 3 Nano style MoE.
-
-    Load balancing is aux-loss-free (expert-bias updates outside gradients),
-    so the optimization target is plain next-token cross-entropy.
-    """
-    return cross_entropy_loss(logits, labels)
-
-
 def _update_all_expert_biases(model: NemotronNanoBlock) -> None:
     """
     Update expert biases across every MoE layer after a training step.
@@ -219,8 +209,7 @@ def _update_all_expert_biases(model: NemotronNanoBlock) -> None:
     The expert_bias is an nnx.Variable (not nnx.Param) so the optimizer does
     not touch it — it is updated only here.
     """
-    for i in range(model.num_layers):
-        block = getattr(model, f"block_{i}")
+    for block in model.blocks:
         block.moe.update_expert_bias(block.moe.last_topk_indices.value)
 
 
@@ -323,7 +312,7 @@ def train_model(
     ) -> jax.Array:
         def loss_fn(model: NemotronNanoBlock) -> jax.Array:
             logits_local = model(x_batch)
-            return total_training_loss(logits=logits_local, labels=y_batch)
+            return cross_entropy_loss(logits_local, y_batch)
 
         total_loss, grads = nnx.value_and_grad(loss_fn)(model)
         optimizer.update(model, grads)
@@ -352,34 +341,27 @@ def evaluate_model(
     seq_len: int,
     eval_batches: int,
     rng_key: jax.Array,
-) -> tuple[float, float, float, jax.Array]:
+) -> tuple[float, float, jax.Array]:
     """
     Evaluates model on validation batches.
 
     Returns:
-    - mean_total_loss
     - mean_ce_loss
     - perplexity = exp(mean_ce_loss)
     - updated rng_key
     """
-    total_losses: list[jax.Array] = []
     ce_losses: list[jax.Array] = []
 
     for _ in range(eval_batches):
         rng_key, batch_key = jax.random.split(rng_key)
         x_batch, y_batch = sample_lm_batch(val_tokens, batch_size, seq_len, batch_key)
         logits = model(x_batch)
-        ce = cross_entropy_loss(logits, y_batch)
-        total = ce
+        ce_losses.append(cross_entropy_loss(logits, y_batch))
 
-        total_losses.append(total)
-        ce_losses.append(ce)
-
-    mean_total = jnp.mean(jnp.stack(total_losses))
     mean_ce = jnp.mean(jnp.stack(ce_losses))
     ppl = jnp.exp(mean_ce)
 
-    return float(mean_total), float(mean_ce), float(ppl), rng_key
+    return float(mean_ce), float(ppl), rng_key
 
 
 def pad_or_trim_context(token_ids: list[int], seq_len: int, pad_id: int) -> jax.Array:
@@ -434,9 +416,7 @@ def generate_reply(
         model_input = pad_or_trim_context(context_ids, seq_len, tokenizer.pad_id)
         logits = model(model_input)
 
-        next_logits: jax.Array = jnp.zeros(0)
-        if isinstance(logits, jax.Array):
-            next_logits = logits[0, -1]
+        next_logits = logits[0, -1]
 
         # Avoid sampling these two control tokens during response generation.
         next_logits = next_logits.at[tokenizer.pad_id].set(-1e9)
@@ -685,7 +665,7 @@ def main() -> None:
     )
 
     # 6) Evaluate.
-    mean_total, mean_ce, perplexity, rng_key = evaluate_model(
+    mean_ce, perplexity, rng_key = evaluate_model(
         model=model,
         val_tokens=val_tokens,
         batch_size=args.batch_size,
@@ -695,9 +675,8 @@ def main() -> None:
     )
 
     print("\nEvaluation:")
-    print(f"  mean total loss: {mean_total:.4f}")
-    print(f"  mean CE loss:    {mean_ce:.4f}")
-    print(f"  perplexity:      {perplexity:.4f}")
+    print(f"  mean CE loss: {mean_ce:.4f}")
+    print(f"  perplexity:   {perplexity:.4f}")
 
     # 7) Chat.
     if not args.skip_chat:
