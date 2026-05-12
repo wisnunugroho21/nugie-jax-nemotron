@@ -44,48 +44,6 @@ import jax.numpy as jnp
 from flax import nnx
 
 
-class MoEExpert(nnx.Module):
-    """
-    A single FFN expert with Squared-ReLU activation.
-
-    The Nemotron 3 Nano paper specifies squared-ReLU for all expert FFNs.
-    The computation is:
-        h = fc1(x)          # expand to hidden dimension
-        h = relu(h) ** 2    # squared-ReLU: zero negatives, then square
-        out = fc2(h)        # compress back to model dimension
-
-    Squaring after ReLU amplifies large activations more than small ones,
-    which acts as a stronger gate and improves expert specialization.
-    """
-
-    def __init__(
-        self,
-        rngs: nnx.Rngs,
-        d_model: int,
-        hidden_dim: int,
-        use_bias: bool = False,  # Paper: no bias on linear layers
-    ):
-        self.d_model = d_model
-        self.hidden_dim = hidden_dim
-
-        # Gate (up) projection: expand token to the expert's hidden dimension.
-        self.fc1 = nnx.Linear(
-            self.d_model, self.hidden_dim, use_bias=use_bias, rngs=rngs
-        )
-        # Down projection: compress back to the model dimension.
-        self.fc2 = nnx.Linear(
-            self.hidden_dim, self.d_model, use_bias=use_bias, rngs=rngs
-        )
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        h = self.fc1(x)
-        # Squared-ReLU: first zero out negatives with ReLU, then square.
-        # relu(x)^2 creates a sparser, more non-linear activation than plain ReLU.
-        h = jax.nn.relu(h)
-        h = h * h  # element-wise square
-        return self.fc2(h)
-
-
 class SparseMoE(nnx.Module):
     """
     Sparse MoE layer matching the Nemotron 3 Nano design (arXiv:2512.20848, §2.1).
@@ -220,30 +178,29 @@ class SparseMoE(nnx.Module):
             rngs=rngs,
         )
 
-        # Instantiate all fine-grained routed experts.
-        for i in range(self.num_routed_experts):
-            setattr(
-                self,
-                f"routed_expert_{i}",
-                MoEExpert(
-                    d_model=self.d_model,
-                    hidden_dim=self.routed_expert_hidden_dim,
-                    use_bias=use_bias,
-                    rngs=rngs,
-                ),
-            )
+        # All routed expert weights are stored pre-stacked so _collect_routed_outputs
+        # can index directly — no jnp.stack() assembly on every forward pass.
+        # routed_W1: (num_routed_experts, d_model, routed_expert_hidden_dim)
+        # routed_W2: (num_routed_experts, routed_expert_hidden_dim, d_model)
+        # No bias on any linear layers, per paper.
+        init = nnx.initializers.lecun_normal()
+        self.routed_W1 = nnx.Param(
+            init(rngs.params(), (self.num_routed_experts, d_model, self.routed_expert_hidden_dim))
+        )
+        self.routed_W2 = nnx.Param(
+            init(rngs.params(), (self.num_routed_experts, self.routed_expert_hidden_dim, d_model))
+        )
 
-        # Instantiate all always-on shared experts.
-        for i in range(self.num_shared_experts):
-            setattr(
-                self,
-                f"shared_expert_{i}",
-                MoEExpert(
-                    d_model=self.d_model,
-                    hidden_dim=self.shared_expert_hidden_dim,
-                    use_bias=use_bias,
-                    rngs=rngs,
-                ),
+        # Shared expert weights are also pre-stacked for the batched einsum in
+        # _collect_shared_outputs. Shared experts keep the full hidden dimension.
+        # shared_W1: (num_shared_experts, d_model, shared_expert_hidden_dim)
+        # shared_W2: (num_shared_experts, shared_expert_hidden_dim, d_model)
+        if self.num_shared_experts > 0:
+            self.shared_W1 = nnx.Param(
+                init(rngs.params(), (self.num_shared_experts, d_model, self.shared_expert_hidden_dim))
+            )
+            self.shared_W2 = nnx.Param(
+                init(rngs.params(), (self.num_shared_experts, self.shared_expert_hidden_dim, d_model))
             )
 
     def _collect_routed_outputs(
@@ -252,13 +209,12 @@ class SparseMoE(nnx.Module):
         topk_indices: jax.Array,
     ) -> jax.Array:
         """
-        Run only the selected routed experts via stacked-weight gather + einsum.
+        Run only the selected routed experts via pre-stacked weight gather + einsum.
 
-        All expert fc1/fc2 kernels are stacked into batched tensors once, then
-        we index with topk_indices to gather only the K selected experts' weights
-        per token. The expert MLPs are applied with two einsums — no loop, no
-        lax.switch, no buffer logic. Only (num_tokens × routed_top_k) expert
-        forward passes are computed; non-selected experts are never touched.
+        Weights are stored pre-stacked as (num_routed_experts, ...) tensors in
+        __init__, so we index directly with topk_indices — no per-forward assembly.
+        Only (num_tokens × routed_top_k) expert forward passes are computed;
+        non-selected experts are never touched.
 
         Args:
             x_flat: (num_tokens, d_model)
@@ -269,20 +225,11 @@ class SparseMoE(nnx.Module):
         """
         num_tokens = x_flat.shape[0]
 
-        # Stack every routed expert's fc1 and fc2 kernels into batched arrays.
-        # Indexing axis-0 of W1/W2 gives one expert's weight matrix.
+        # Weights are pre-stacked at init time — no assembly cost here.
         # W1: (num_routed_experts, d_model,      routed_expert_hidden_dim)
         # W2: (num_routed_experts, routed_expert_hidden_dim, d_model)
-        W1 = jnp.stack(
-            [getattr(self, f"routed_expert_{i}").fc1.kernel.value
-             for i in range(self.num_routed_experts)],
-            axis=0,
-        )
-        W2 = jnp.stack(
-            [getattr(self, f"routed_expert_{i}").fc2.kernel.value
-             for i in range(self.num_routed_experts)],
-            axis=0,
-        )
+        W1 = self.routed_W1.value
+        W2 = self.routed_W2.value
 
         # Gather only the weights of each token's top-k selected experts.
         # topk_indices: (num_tokens, routed_top_k)  →  index into axis-0 of W1/W2
@@ -317,10 +264,11 @@ class SparseMoE(nnx.Module):
 
     def _collect_shared_outputs(self, x_flat: jax.Array) -> jax.Array:
         """
-        Run every shared expert on every token, then stack the results.
+        Run all shared experts on every token via a single batched einsum.
 
         Shared experts are always active — no routing decision is made.
-        Their outputs will be summed in __call__ to form a combined shared signal.
+        All experts are applied in parallel using pre-stacked weight matrices,
+        producing one output per expert per token in a single fused operation.
 
         Args:
             x_flat: (num_tokens, d_model)
@@ -331,11 +279,16 @@ class SparseMoE(nnx.Module):
         if self.num_shared_experts == 0:
             return jnp.zeros((x_flat.shape[0], 0, self.d_model), dtype=x_flat.dtype)
 
-        outputs = []
-        for i in range(self.num_shared_experts):
-            expert = getattr(self, f"shared_expert_{i}")
-            outputs.append(expert(x_flat))
-        return jnp.stack(outputs, axis=1)
+        # All shared experts run in one batched einsum — no sequential loop.
+        # 'td,edh->teh': for each of the E shared experts, project every token
+        # from d_model up to shared_expert_hidden_dim simultaneously.
+        h = jnp.einsum("td,edh->teh", x_flat, self.shared_W1.value)
+        # Squared-ReLU: relu(x)^2 — same activation as the routed experts.
+        h = jax.nn.relu(h)
+        h = h * h
+        # 'teh,ehd->ted': project all shared expert hidden states back to d_model.
+        # out: (num_tokens, num_shared_experts, d_model)
+        return jnp.einsum("teh,ehd->ted", h, self.shared_W2.value)
 
     def update_expert_bias(self, topk_indices: jax.Array) -> None:
         """
