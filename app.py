@@ -534,8 +534,13 @@ def train_model(
     batch_size: int,
     seq_len: int,
     rng_key: jax.Array,
+    debug_mask_ratio: bool = False,
+    debug_mask_every: int = 1,
 ) -> jax.Array:
     """Runs a tiny training loop and prints readable metrics."""
+
+    if debug_mask_every <= 0:
+        raise ValueError("debug_mask_every must be > 0")
 
     @nnx.jit
     def train_step(
@@ -571,6 +576,15 @@ def train_model(
         total_loss = train_step(model, optimizer, x_batch, y_batch, y_mask_batch)
 
         print(f"  step {step + 1:>3}/{steps} | ce={float(total_loss):.4f}")
+        if debug_mask_ratio and ((step + 1) % debug_mask_every == 0):
+            supervised_tokens = float(jnp.sum(y_mask_batch))
+            total_tokens = int(y_mask_batch.size)
+            ratio = supervised_tokens / max(total_tokens, 1)
+            print(
+                "    mask-debug "
+                f"supervised={supervised_tokens:.1f}/{total_tokens} "
+                f"ratio={ratio:.4f}"
+            )
 
     return rng_key
 
@@ -861,6 +875,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="<|assistant|>",
         help="Role tag used to mark assistant turns in serialized chat text",
     )
+    parser.add_argument(
+        "--debug-mask-ratio",
+        action="store_true",
+        help="Print supervised-token mask ratio during training",
+    )
+    parser.add_argument(
+        "--debug-mask-every",
+        type=int,
+        default=1,
+        help="Print mask-debug line every N training steps",
+    )
     return parser
 
 
@@ -1008,6 +1033,8 @@ def main() -> None:
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         rng_key=rng_key,
+        debug_mask_ratio=args.debug_mask_ratio,
+        debug_mask_every=args.debug_mask_every,
     )
 
     # 6) Evaluate.

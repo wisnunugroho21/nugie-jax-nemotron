@@ -135,6 +135,8 @@ python app.py \
    --val-jsonl data/oasst2/val.jsonl \
    --jsonl-text-key serialized_text \
    --assistant-only-loss \
+   --debug-mask-ratio \
+   --debug-mask-every 1 \
    --user-role-tag "<|user|>" \
    --assistant-role-tag "<|assistant|>" \
    --steps 80 \
@@ -145,6 +147,15 @@ python app.py \
 
 When `--assistant-only-loss` is enabled, user turns and role tags are excluded
 from CE loss; assistant turn content remains supervised.
+
+With `--debug-mask-ratio`, training prints a per-batch mask summary line like:
+
+```text
+mask-debug supervised=320.0/512 ratio=0.6250
+```
+
+This helps verify that new datasets still contain enough assistant-supervised
+tokens after role-tag parsing.
 
 **What happens in `app.py`:**
 
