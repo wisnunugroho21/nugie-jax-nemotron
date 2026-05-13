@@ -123,6 +123,29 @@ python app.py \
 `app.py` still supports TinyStories by default. JSONL mode only changes where
 the text comes from; the training objective and model pipeline remain unchanged.
 
+### Phase-2: Assistant-Only Loss Masking
+
+For chat SFT-style training, you can mask loss to assistant content tokens only
+while keeping the same model architecture.
+
+```bash
+python app.py \
+   --dataset-format jsonl \
+   --train-jsonl data/oasst2/train.jsonl \
+   --val-jsonl data/oasst2/val.jsonl \
+   --jsonl-text-key serialized_text \
+   --assistant-only-loss \
+   --user-role-tag "<|user|>" \
+   --assistant-role-tag "<|assistant|>" \
+   --steps 80 \
+   --batch-size 8 \
+   --seq-len 64 \
+   --skip-chat
+```
+
+When `--assistant-only-loss` is enabled, user turns and role tags are excluded
+from CE loss; assistant turn content remains supervised.
+
 **What happens in `app.py`:**
 
 1. **Data Loading**: Loads TinyStories dataset

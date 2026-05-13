@@ -141,6 +141,73 @@ def _extract_story_text(example: dict[str, object]) -> str:
     return ""
 
 
+def _encode_segment(tokenizer: "PreTrainedTokenizerBase", text: str) -> list[int]:
+    """Tokenizes raw text without adding any special tokens."""
+    return list(tokenizer.encode(text, add_special_tokens=False))
+
+
+def encode_text_with_assistant_mask(
+    tokenizer: "PreTrainedTokenizerBase",
+    text: str,
+    user_role_tag: str,
+    assistant_role_tag: str,
+) -> tuple[list[int], list[float]]:
+    """
+    Encodes one role-tagged conversation and returns per-token loss mask.
+
+    Mask semantics:
+    - 1.0 for assistant content tokens
+    - 0.0 for user content tokens and role tag tokens
+    """
+    token_ids: list[int] = []
+    loss_mask: list[float] = []
+
+    if not user_role_tag or not assistant_role_tag:
+        raise ValueError("user_role_tag and assistant_role_tag must be non-empty")
+
+    cursor = 0
+    current_role: str | None = None
+
+    while cursor < len(text):
+        next_user = text.find(user_role_tag, cursor)
+        next_assistant = text.find(assistant_role_tag, cursor)
+
+        candidates = [idx for idx in (next_user, next_assistant) if idx != -1]
+        next_tag_index = min(candidates) if candidates else -1
+
+        if next_tag_index == -1:
+            chunk = text[cursor:]
+            if chunk:
+                chunk_ids = _encode_segment(tokenizer, chunk)
+                mask_value = 1.0 if current_role == "assistant" else 0.0
+                token_ids.extend(chunk_ids)
+                loss_mask.extend([mask_value] * len(chunk_ids))
+            break
+
+        if next_tag_index > cursor:
+            chunk = text[cursor:next_tag_index]
+            if chunk:
+                chunk_ids = _encode_segment(tokenizer, chunk)
+                mask_value = 1.0 if current_role == "assistant" else 0.0
+                token_ids.extend(chunk_ids)
+                loss_mask.extend([mask_value] * len(chunk_ids))
+
+        if text.startswith(user_role_tag, next_tag_index):
+            tag_text = user_role_tag
+            current_role = "user"
+        else:
+            tag_text = assistant_role_tag
+            current_role = "assistant"
+
+        tag_ids = _encode_segment(tokenizer, tag_text)
+        token_ids.extend(tag_ids)
+        loss_mask.extend([0.0] * len(tag_ids))
+
+        cursor = next_tag_index + len(tag_text)
+
+    return token_ids, loss_mask
+
+
 # =============================================================================
 # Dataset
 # =============================================================================
@@ -290,34 +357,69 @@ def prepare_datasets(
     train_texts: list[str],
     val_texts: list[str],
     seq_len: int,
-) -> tuple[jax.Array, jax.Array]:
+    assistant_only_loss: bool = False,
+    user_role_tag: str = "<|user|>",
+    assistant_role_tag: str = "<|assistant|>",
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """
     Creates train/val token streams from TinyStories text.
 
     Output format:
     - train_tokens: shape (num_train_tokens,)
     - val_tokens: shape (num_val_tokens,)
+    - train_loss_mask: shape (num_train_tokens,)
+    - val_loss_mask: shape (num_val_tokens,)
     """
     if not train_texts or not val_texts:
         raise ValueError("train_texts and val_texts must both be non-empty")
 
-    # Keep train/validation streams separate so evaluation stays honest.
-    train_joined = "\n\n".join(train_texts)
-    val_joined = "\n\n".join(val_texts)
+    def build_stream(texts: list[str]) -> tuple[list[int], list[float]]:
+        if not assistant_only_loss:
+            joined = "\n\n".join(texts)
+            ids = encode_text(tokenizer, joined, add_bos=True, add_eos=True)
+            return ids, [1.0] * len(ids)
 
-    # Add BOS/EOS so the model can learn sequence boundaries.
-    train_ids = encode_text(tokenizer, train_joined, add_bos=True, add_eos=True)
-    val_ids = encode_text(tokenizer, val_joined, add_bos=True, add_eos=True)
+        _, bos_id, eos_id = _get_special_token_ids(tokenizer)
+        sep_ids = _encode_segment(tokenizer, "\n\n")
+
+        all_ids: list[int] = [bos_id]
+        all_mask: list[float] = [0.0]
+
+        for text_index, text in enumerate(texts):
+            ids, mask = encode_text_with_assistant_mask(
+                tokenizer=tokenizer,
+                text=text,
+                user_role_tag=user_role_tag,
+                assistant_role_tag=assistant_role_tag,
+            )
+            all_ids.extend(ids)
+            all_mask.extend(mask)
+
+            if text_index < len(texts) - 1:
+                all_ids.extend(sep_ids)
+                all_mask.extend([0.0] * len(sep_ids))
+
+        all_ids.append(eos_id)
+        all_mask.append(0.0)
+
+        return all_ids, all_mask
+
+    train_ids, train_mask = build_stream(train_texts)
+    val_ids, val_mask = build_stream(val_texts)
 
     train_tokens = jnp.array(train_ids, dtype=jnp.int32)
     val_tokens = jnp.array(val_ids, dtype=jnp.int32)
+    train_loss_mask = jnp.array(train_mask, dtype=jnp.float32)
+    val_loss_mask = jnp.array(val_mask, dtype=jnp.float32)
 
     # Ensure both splits are large enough to sample (x, y) windows.
     min_stream_len = seq_len + 2
     train_tokens = _ensure_min_length(train_tokens, min_stream_len)
     val_tokens = _ensure_min_length(val_tokens, min_stream_len)
+    train_loss_mask = _ensure_min_length(train_loss_mask, min_stream_len)
+    val_loss_mask = _ensure_min_length(val_loss_mask, min_stream_len)
 
-    return train_tokens, val_tokens
+    return train_tokens, val_tokens, train_loss_mask, val_loss_mask
 
 
 # =============================================================================
@@ -325,10 +427,22 @@ def prepare_datasets(
 # =============================================================================
 
 
-def cross_entropy_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
-    """Standard language-model cross-entropy."""
+def cross_entropy_loss(
+    logits: jax.Array,
+    labels: jax.Array,
+    loss_mask: jax.Array | None = None,
+) -> jax.Array:
+    """Language-model cross-entropy with optional token-level masking."""
     one_hot = jax.nn.one_hot(labels, logits.shape[-1])
-    return optax.softmax_cross_entropy(logits, one_hot).mean()
+    losses = optax.softmax_cross_entropy(logits, one_hot)
+
+    if loss_mask is None:
+        return losses.mean()
+
+    mask = loss_mask.astype(losses.dtype)
+    masked_sum = jnp.sum(losses * mask)
+    denom = jnp.sum(mask)
+    return jnp.where(denom > 0, masked_sum / denom, losses.mean())
 
 
 def create_lr_schedule(
@@ -377,10 +491,11 @@ def _update_all_expert_biases(model: NemotronNanoBlock) -> None:
 
 def sample_lm_batch(
     token_stream: jax.Array,
+    loss_mask_stream: jax.Array,
     batch_size: int,
     seq_len: int,
     rng_key: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Samples random contiguous windows for next-token prediction.
 
@@ -396,20 +511,25 @@ def sample_lm_batch(
 
     x_list: list[jax.Array] = []
     y_list: list[jax.Array] = []
+    m_list: list[jax.Array] = []
     for start in starts.tolist():
-        window = token_stream[start : start + seq_len + 1]
-        x_list.append(window[:-1])
-        y_list.append(window[1:])
+        token_window = token_stream[start : start + seq_len + 1]
+        mask_window = loss_mask_stream[start : start + seq_len + 1]
+        x_list.append(token_window[:-1])
+        y_list.append(token_window[1:])
+        m_list.append(mask_window[1:])
 
     x = jnp.stack(x_list, axis=0)
     y = jnp.stack(y_list, axis=0)
-    return x, y
+    y_mask = jnp.stack(m_list, axis=0)
+    return x, y, y_mask
 
 
 def train_model(
     model: NemotronNanoBlock,
     optimizer: nnx.Optimizer,
     train_tokens: jax.Array,
+    train_loss_mask: jax.Array,
     steps: int,
     batch_size: int,
     seq_len: int,
@@ -423,10 +543,11 @@ def train_model(
         optimizer: nnx.Optimizer,
         x_batch: jax.Array,
         y_batch: jax.Array,
+        y_mask_batch: jax.Array,
     ) -> jax.Array:
         def loss_fn(model: NemotronNanoBlock) -> jax.Array:
             logits_local = model(x_batch)
-            return cross_entropy_loss(logits_local, y_batch)
+            return cross_entropy_loss(logits_local, y_batch, loss_mask=y_mask_batch)
 
         total_loss, grads = nnx.value_and_grad(loss_fn)(model)
         optimizer.update(model, grads)
@@ -440,8 +561,14 @@ def train_model(
     print("\nTraining:")
     for step in range(steps):
         rng_key, batch_key = jax.random.split(rng_key)
-        x_batch, y_batch = sample_lm_batch(train_tokens, batch_size, seq_len, batch_key)
-        total_loss = train_step(model, optimizer, x_batch, y_batch)
+        x_batch, y_batch, y_mask_batch = sample_lm_batch(
+            train_tokens,
+            train_loss_mask,
+            batch_size,
+            seq_len,
+            batch_key,
+        )
+        total_loss = train_step(model, optimizer, x_batch, y_batch, y_mask_batch)
 
         print(f"  step {step + 1:>3}/{steps} | ce={float(total_loss):.4f}")
 
@@ -451,6 +578,7 @@ def train_model(
 def evaluate_model(
     model: NemotronNanoBlock,
     val_tokens: jax.Array,
+    val_loss_mask: jax.Array,
     batch_size: int,
     seq_len: int,
     eval_batches: int,
@@ -468,9 +596,15 @@ def evaluate_model(
 
     for _ in range(eval_batches):
         rng_key, batch_key = jax.random.split(rng_key)
-        x_batch, y_batch = sample_lm_batch(val_tokens, batch_size, seq_len, batch_key)
+        x_batch, y_batch, y_mask_batch = sample_lm_batch(
+            val_tokens,
+            val_loss_mask,
+            batch_size,
+            seq_len,
+            batch_key,
+        )
         logits = model(x_batch)
-        ce_losses.append(cross_entropy_loss(logits, y_batch))
+        ce_losses.append(cross_entropy_loss(logits, y_batch, loss_mask=y_mask_batch))
 
     mean_ce = jnp.mean(jnp.stack(ce_losses))
     ppl = jnp.exp(mean_ce)
@@ -707,6 +841,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run train+eval only (useful for non-interactive testing)",
     )
+    parser.add_argument(
+        "--assistant-only-loss",
+        action="store_true",
+        help=(
+            "Mask loss to assistant content tokens only using role tags in text "
+            "(recommended with --dataset-format=jsonl chat data)"
+        ),
+    )
+    parser.add_argument(
+        "--user-role-tag",
+        type=str,
+        default="<|user|>",
+        help="Role tag used to mark user turns in serialized chat text",
+    )
+    parser.add_argument(
+        "--assistant-role-tag",
+        type=str,
+        default="<|assistant|>",
+        help="Role tag used to mark assistant turns in serialized chat text",
+    )
     return parser
 
 
@@ -721,6 +875,11 @@ def main() -> None:
         raise ValueError("--eval-batches must be > 0")
 
     print("Initializing minimal Nemotron app...")
+
+    if args.assistant_only_loss and args.dataset_format != "jsonl":
+        print(
+            "Note: --assistant-only-loss is most useful with role-tagged chat JSONL data."
+        )
 
     # 1) Load text data from selected dataset source.
     if args.dataset_format == "tinystories":
@@ -829,11 +988,14 @@ def main() -> None:
     rng_key = jax.random.PRNGKey(args.seed + 1)
 
     # 4) Prepare token streams from train/validation stories.
-    train_tokens, val_tokens = prepare_datasets(
+    train_tokens, val_tokens, train_loss_mask, val_loss_mask = prepare_datasets(
         tokenizer=tokenizer,
         train_texts=train_texts,
         val_texts=val_texts,
         seq_len=args.seq_len,
+        assistant_only_loss=args.assistant_only_loss,
+        user_role_tag=args.user_role_tag,
+        assistant_role_tag=args.assistant_role_tag,
     )
 
     # 5) Train.
@@ -841,6 +1003,7 @@ def main() -> None:
         model=model,
         optimizer=optimizer,
         train_tokens=train_tokens,
+        train_loss_mask=train_loss_mask,
         steps=args.steps,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
@@ -851,6 +1014,7 @@ def main() -> None:
     mean_ce, perplexity, rng_key = evaluate_model(
         model=model,
         val_tokens=val_tokens,
+        val_loss_mask=val_loss_mask,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         eval_batches=args.eval_batches,
