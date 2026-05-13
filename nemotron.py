@@ -28,6 +28,10 @@ from attention import GroupedQueryAttention
 from mamba_2 import Mamba2Block
 from moe import SparseMoE
 
+# =============================================================================
+# Config
+# =============================================================================
+
 
 def _default_patterns() -> list[tuple[str, int]]:
     return [
@@ -62,7 +66,7 @@ class NemotronConfig:
     num_kv_heads: int = 1
     attention_head_dim: int = 32
 
-    # Mamba-2 settings (reusing existing Mamba2Block implementation)
+    # Mamba-2 settings
     mamba_d_state: int = 64
     mamba_d_conv: int = 4
     mamba_expand: int = 2
@@ -183,6 +187,11 @@ class NemotronConfig:
         )
 
 
+# =============================================================================
+# Helper
+# =============================================================================
+
+
 def _build_mamba(config: NemotronConfig, rngs: nnx.Rngs) -> Mamba2Block:
     return Mamba2Block(
         d_model=config.d_model,
@@ -208,6 +217,11 @@ def _build_moe(config: NemotronConfig, rngs: nnx.Rngs) -> SparseMoE:
         use_bias=False,
         rngs=rngs,
     )
+
+
+# =============================================================================
+# Mamba MoE Block
+# =============================================================================
 
 
 class MambaMoEBlock(nnx.Module):
@@ -237,6 +251,11 @@ class MambaMoEBlock(nnx.Module):
 
         # MoE residual path.
         return x + self.moe(self.norm_moe(x))
+
+
+# =============================================================================
+# Mamba Attention MoE Block
+# =============================================================================
 
 
 class MambaAttentionMoEBlock(nnx.Module):
@@ -280,6 +299,11 @@ class MambaAttentionMoEBlock(nnx.Module):
 
         # MoE residual path.
         return x + self.moe(self.norm_moe(x))
+
+
+# =============================================================================
+# Nemotron 3 Nano Block
+# =============================================================================
 
 
 class NemotronNanoBlock(nnx.Module):

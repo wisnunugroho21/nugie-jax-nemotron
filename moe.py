@@ -43,6 +43,10 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+# =============================================================================
+# Sparse MoE Block
+# =============================================================================
+
 
 class SparseMoE(nnx.Module):
     """
@@ -185,10 +189,16 @@ class SparseMoE(nnx.Module):
         # No bias on any linear layers, per paper.
         init = nnx.initializers.lecun_normal()
         self.routed_W1 = nnx.Param(
-            init(rngs.params(), (self.num_routed_experts, d_model, self.routed_expert_hidden_dim))
+            init(
+                rngs.params(),
+                (self.num_routed_experts, d_model, self.routed_expert_hidden_dim),
+            )
         )
         self.routed_W2 = nnx.Param(
-            init(rngs.params(), (self.num_routed_experts, self.routed_expert_hidden_dim, d_model))
+            init(
+                rngs.params(),
+                (self.num_routed_experts, self.routed_expert_hidden_dim, d_model),
+            )
         )
 
         # Shared expert weights are also pre-stacked for the batched einsum in
@@ -197,10 +207,16 @@ class SparseMoE(nnx.Module):
         # shared_W2: (num_shared_experts, shared_expert_hidden_dim, d_model)
         if self.num_shared_experts > 0:
             self.shared_W1 = nnx.Param(
-                init(rngs.params(), (self.num_shared_experts, d_model, self.shared_expert_hidden_dim))
+                init(
+                    rngs.params(),
+                    (self.num_shared_experts, d_model, self.shared_expert_hidden_dim),
+                )
             )
             self.shared_W2 = nnx.Param(
-                init(rngs.params(), (self.num_shared_experts, self.shared_expert_hidden_dim, d_model))
+                init(
+                    rngs.params(),
+                    (self.num_shared_experts, self.shared_expert_hidden_dim, d_model),
+                )
             )
 
     def _collect_routed_outputs(
@@ -389,7 +405,9 @@ class SparseMoE(nnx.Module):
         # Using original scores preserves the expert's learned signal magnitude.
         # Gather only the top-k scores — no need to build a full (num_tokens, num_routed_experts) tensor.
         token_ids = jnp.arange(num_tokens)[:, None]  # (num_tokens, 1)
-        selected_scores = routed_scores[token_ids, topk_indices]  # (num_tokens, routed_top_k)
+        selected_scores = routed_scores[
+            token_ids, topk_indices
+        ]  # (num_tokens, routed_top_k)
 
         # Step 6: Renormalize so selected gate weights sum to 1 per token.
         # This keeps the output scale stable regardless of the absolute score values.

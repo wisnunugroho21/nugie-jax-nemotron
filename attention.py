@@ -15,6 +15,10 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+# =============================================================================
+# Rope Algorithm
+# =============================================================================
+
 
 def _apply_rope(x: jax.Array) -> jax.Array:
     """
@@ -41,9 +45,7 @@ def _apply_rope(x: jax.Array) -> jax.Array:
     half = head_dim // 2
 
     # Frequency for each dimension pair: θ_i = 1 / 10000^(2i / head_dim)
-    freqs = 1.0 / (
-        10000.0 ** (jnp.arange(half, dtype=jnp.float32) * 2 / head_dim)
-    )
+    freqs = 1.0 / (10000.0 ** (jnp.arange(half, dtype=jnp.float32) * 2 / head_dim))
 
     # Position indices 0, 1, ..., seqlen-1
     positions = jnp.arange(seqlen, dtype=jnp.float32)
@@ -68,6 +70,11 @@ def _apply_rope(x: jax.Array) -> jax.Array:
     # Interleave rotated even/odd channels back to the original head_dim layout.
     x_rot = jnp.stack([x_rot_even, x_rot_odd], axis=-1)
     return jnp.reshape(x_rot, x.shape)
+
+
+# =============================================================================
+# Attention Block
+# =============================================================================
 
 
 class GroupedQueryAttention(nnx.Module):

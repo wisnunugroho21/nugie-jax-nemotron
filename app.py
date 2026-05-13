@@ -29,6 +29,11 @@ from nemotron import NemotronConfig, NemotronNanoBlock
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
+# =============================================================================
+# Tokenizer
+# =============================================================================
+
+
 def load_hf_tokenizer(
     tokenizer_name: str,
     cache_dir: str | None = None,
@@ -81,14 +86,18 @@ def load_hf_tokenizer(
     return tokenizer
 
 
-def _get_special_token_ids(tokenizer: "PreTrainedTokenizerBase") -> tuple[int, int, int]:
+def _get_special_token_ids(
+    tokenizer: "PreTrainedTokenizerBase",
+) -> tuple[int, int, int]:
     """Returns guaranteed integer IDs for PAD/BOS/EOS tokens."""
     if (
         tokenizer.pad_token_id is None
         or tokenizer.bos_token_id is None
         or tokenizer.eos_token_id is None
     ):
-        raise ValueError("Tokenizer must define pad_token_id, bos_token_id, eos_token_id")
+        raise ValueError(
+            "Tokenizer must define pad_token_id, bos_token_id, eos_token_id"
+        )
 
     return (
         int(tokenizer.pad_token_id),  # type: ignore[arg-type]
@@ -128,6 +137,11 @@ def _extract_story_text(example: dict[str, object]) -> str:
             if cleaned:
                 return cleaned
     return ""
+
+
+# =============================================================================
+# Dataset
+# =============================================================================
 
 
 def load_tinystories_texts(
@@ -207,30 +221,6 @@ def split_train_val_texts(
     return train_texts, val_texts
 
 
-def cross_entropy_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
-    """Standard language-model cross-entropy."""
-    one_hot = jax.nn.one_hot(labels, logits.shape[-1])
-    return optax.softmax_cross_entropy(logits, one_hot).mean()
-
-
-def _update_all_expert_biases(model: NemotronNanoBlock) -> None:
-    """
-    Update expert biases across every MoE layer after a training step.
-
-    This is the aux-loss-free load balancing step (Wang et al. 2024, §2.4).
-    Each MoE layer stored the top-k indices from its last forward pass in
-    `moe.last_topk_indices`. We read those indices here and call
-    `update_expert_bias`, which nudges each expert's bias by +/-bias_update_rate
-    depending on whether that expert was over- or under-utilized.
-
-    IMPORTANT: Call this AFTER optimizer.update, outside the gradient computation.
-    The expert_bias is an nnx.Variable (not nnx.Param) so the optimizer does
-    not touch it — it is updated only here.
-    """
-    for block in model.blocks:
-        block.moe.update_expert_bias(block.moe.last_topk_indices[...])
-
-
 def _ensure_min_length(tokens: jax.Array, min_length: int) -> jax.Array:
     """
     Repeats tokens until we have enough positions for batching.
@@ -277,6 +267,61 @@ def prepare_datasets(
     val_tokens = _ensure_min_length(val_tokens, min_stream_len)
 
     return train_tokens, val_tokens
+
+
+# =============================================================================
+# Optimization
+# =============================================================================
+
+
+def cross_entropy_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
+    """Standard language-model cross-entropy."""
+    one_hot = jax.nn.one_hot(labels, logits.shape[-1])
+    return optax.softmax_cross_entropy(logits, one_hot).mean()
+
+
+def create_lr_schedule(
+    max_steps: int, warmup_steps: int, peak_lr: float
+) -> optax.Schedule:
+    """
+    Creates a two-phase learning rate schedule:
+      Phase 1 (steps 0 .. warmup_steps):        linear ramp  0 → peak_lr
+      Phase 2 (steps warmup_steps .. max_steps): cosine decay peak_lr → 0
+
+    This avoids early training instability (warmup) while allowing the
+    optimizer to fine-tune at smaller learning rates later (cosine decay).
+    """
+    warmup = optax.linear_schedule(
+        init_value=0.0,
+        end_value=peak_lr,
+        transition_steps=warmup_steps,
+    )
+    decay = optax.cosine_decay_schedule(
+        init_value=peak_lr,
+        decay_steps=max(max_steps - warmup_steps, 1),
+    )
+    return optax.join_schedules(
+        schedules=[warmup, decay],
+        boundaries=[warmup_steps],
+    )
+
+
+def _update_all_expert_biases(model: NemotronNanoBlock) -> None:
+    """
+    Update expert biases across every MoE layer after a training step.
+
+    This is the aux-loss-free load balancing step (Wang et al. 2024, §2.4).
+    Each MoE layer stored the top-k indices from its last forward pass in
+    `moe.last_topk_indices`. We read those indices here and call
+    `update_expert_bias`, which nudges each expert's bias by +/-bias_update_rate
+    depending on whether that expert was over- or under-utilized.
+
+    IMPORTANT: Call this AFTER optimizer.update, outside the gradient computation.
+    The expert_bias is an nnx.Variable (not nnx.Param) so the optimizer does
+    not touch it — it is updated only here.
+    """
+    for block in model.blocks:
+        block.moe.update_expert_bias(block.moe.last_topk_indices[...])
 
 
 def sample_lm_batch(
@@ -382,6 +427,11 @@ def evaluate_model(
     return float(mean_ce), float(ppl), rng_key
 
 
+# =============================================================================
+# Chat
+# =============================================================================
+
+
 def pad_or_trim_context(token_ids: list[int], seq_len: int, pad_id: int) -> jax.Array:
     """
     Makes context length exactly `seq_len` so Mamba chunking constraints hold.
@@ -469,9 +519,6 @@ def chat_loop(
     """Runs a simple interactive terminal chatbot."""
     print("\nChatbot is ready. Type 'quit' or 'exit' to stop.")
 
-    # Tiny system instruction to stabilize output format.
-    history = "System: You are a concise and helpful assistant.\n"
-
     while True:
         user_text = input("You: ").strip()
         if user_text.lower() in {"quit", "exit"}:
@@ -480,49 +527,23 @@ def chat_loop(
         if not user_text:
             continue
 
-        history += f"User: {user_text}\nAssistant: "
         reply, rng_key = generate_reply(
             model=model,
             tokenizer=tokenizer,
-            prompt_text=history,
+            prompt_text=user_text,
             seq_len=seq_len,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             rng_key=rng_key,
         )
+
         reply = reply.strip() or "..."
-
         print(f"Bot: {reply}")
-        history += reply + "\n"
-
-        # Keep only recent history so context stays bounded and simple.
-        history = history[-1200:]
 
 
-def create_lr_schedule(
-    max_steps: int, warmup_steps: int, peak_lr: float
-) -> optax.Schedule:
-    """
-    Creates a two-phase learning rate schedule:
-      Phase 1 (steps 0 .. warmup_steps):        linear ramp  0 → peak_lr
-      Phase 2 (steps warmup_steps .. max_steps): cosine decay peak_lr → 0
-
-    This avoids early training instability (warmup) while allowing the
-    optimizer to fine-tune at smaller learning rates later (cosine decay).
-    """
-    warmup = optax.linear_schedule(
-        init_value=0.0,
-        end_value=peak_lr,
-        transition_steps=warmup_steps,
-    )
-    decay = optax.cosine_decay_schedule(
-        init_value=peak_lr,
-        decay_steps=max(max_steps - warmup_steps, 1),
-    )
-    return optax.join_schedules(
-        schedules=[warmup, decay],
-        boundaries=[warmup_steps],
-    )
+# =============================================================================
+# Main
+# =============================================================================
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -675,11 +696,11 @@ def main() -> None:
         warmup_steps=warmup_steps,
         peak_lr=3e-4,
     )
-    tx = optax.chain(
+    gradient_transformation = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(learning_rate=lr_schedule, weight_decay=0.1),
     )
-    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    optimizer = nnx.Optimizer(model, gradient_transformation, wrt=nnx.Param)
 
     # Use a separate key stream for data/generation randomness.
     rng_key = jax.random.PRNGKey(args.seed + 1)
