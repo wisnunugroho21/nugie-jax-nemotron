@@ -726,6 +726,28 @@ def generate_reply(
     return str(decoded), rng_key
 
 
+def build_chat_prompt(
+    turns: list[tuple[str, str]],
+    user_text: str,
+    user_role_tag: str,
+    assistant_role_tag: str,
+) -> str:
+    """
+    Builds a role-tagged multi-turn prompt from chat history and latest user text.
+
+    Format:
+      <|user|>...<|assistant|>...<|user|>...<|assistant|>
+    """
+    parts: list[str] = []
+    for prev_user, prev_assistant in turns:
+        parts.append(f"{user_role_tag}\n{prev_user.strip()}\n")
+        parts.append(f"{assistant_role_tag}\n{prev_assistant.strip()}\n")
+
+    parts.append(f"{user_role_tag}\n{user_text.strip()}\n")
+    parts.append(f"{assistant_role_tag}\n")
+    return "".join(parts)
+
+
 def chat_loop(
     model: NemotronNanoBlock,
     tokenizer: "PreTrainedTokenizerBase",
@@ -733,22 +755,51 @@ def chat_loop(
     temperature: float,
     max_new_tokens: int,
     rng_key: jax.Array,
+    user_role_tag: str,
+    assistant_role_tag: str,
+    history_turns: int,
 ) -> None:
-    """Runs a simple interactive terminal chatbot."""
-    print("\nChatbot is ready. Type 'quit' or 'exit' to stop.")
+    """Runs an interactive terminal chatbot with short conversation memory."""
+    if history_turns <= 0:
+        raise ValueError("history_turns must be > 0")
+
+    print("\nChatbot is ready. Commands: /help, /reset, /exit")
+    print(f"Using up to {history_turns} previous turns as prompt context.")
+
+    turns: list[tuple[str, str]] = []
 
     while True:
-        user_text = input("You: ").strip()
-        if user_text.lower() in {"quit", "exit"}:
+        try:
+            user_text = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBot: bye.")
+            break
+
+        lower_text = user_text.lower()
+        if lower_text in {"quit", "exit", "/exit"}:
             print("Bot: bye.")
             break
         if not user_text:
             continue
+        if lower_text == "/help":
+            print("Bot: /reset clears memory, /exit ends chat.")
+            continue
+        if lower_text == "/reset":
+            turns.clear()
+            print("Bot: conversation memory cleared.")
+            continue
+
+        prompt_text = build_chat_prompt(
+            turns=turns[-history_turns:],
+            user_text=user_text,
+            user_role_tag=user_role_tag,
+            assistant_role_tag=assistant_role_tag,
+        )
 
         reply, rng_key = generate_reply(
             model=model,
             tokenizer=tokenizer,
-            prompt_text=user_text,
+            prompt_text=prompt_text,
             seq_len=seq_len,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -756,6 +807,7 @@ def chat_loop(
         )
 
         reply = reply.strip() or "..."
+        turns.append((user_text, reply))
         print(f"Bot: {reply}")
 
 
@@ -905,6 +957,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Print mask-debug line every N training steps",
     )
+    parser.add_argument(
+        "--chat-history-turns",
+        type=int,
+        default=6,
+        help="How many previous user-assistant turns to include in chat context",
+    )
     return parser
 
 
@@ -917,6 +975,8 @@ def main() -> None:
         raise ValueError("--batch-size must be > 0")
     if args.eval_batches <= 0:
         raise ValueError("--eval-batches must be > 0")
+    if args.chat_history_turns <= 0:
+        raise ValueError("--chat-history-turns must be > 0")
 
     print("Initializing minimal Nemotron app...")
 
@@ -1080,6 +1140,9 @@ def main() -> None:
             temperature=args.temperature,
             max_new_tokens=args.max_new_tokens,
             rng_key=rng_key,
+            user_role_tag=args.user_role_tag,
+            assistant_role_tag=args.assistant_role_tag,
+            history_turns=args.chat_history_turns,
         )
 
 
