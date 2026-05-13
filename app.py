@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import nnx
 
@@ -811,6 +812,72 @@ def chat_loop(
         print(f"Bot: {reply}")
 
 
+def load_checkpoint_into_model(
+    model: NemotronNanoBlock,
+    checkpoint_path: str,
+) -> int:
+    """
+    Loads model parameter leaves from a legacy .npz checkpoint.
+
+    Expected checkpoint format:
+    - Keys: param_0, param_1, ..., param_N
+    - Values: numpy arrays matching current model parameter shapes in order
+    """
+    path = Path(checkpoint_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    param_state = nnx.state(model, nnx.Param)
+    param_leaves = jax.tree_util.tree_leaves(param_state)
+    tree_def = jax.tree_util.tree_structure(param_state)
+
+    with np.load(path, allow_pickle=False) as ckpt:
+        keys = list(ckpt.files)
+        if not keys:
+            raise ValueError(f"Checkpoint is empty: {checkpoint_path}")
+
+        if not all(key.startswith("param_") for key in keys):
+            raise ValueError(
+                "Checkpoint format mismatch: expected keys like 'param_0', 'param_1', ..."
+            )
+
+        try:
+            ordered_keys = sorted(keys, key=lambda name: int(name.split("_", 1)[1]))
+        except ValueError as exc:
+            raise ValueError(
+                "Checkpoint keys must follow 'param_<index>' format with integer index"
+            ) from exc
+
+        ckpt_leaves = [jnp.asarray(ckpt[key]) for key in ordered_keys]
+
+    if len(ckpt_leaves) != len(param_leaves):
+        raise ValueError(
+            "Checkpoint parameter count mismatch: "
+            f"checkpoint has {len(ckpt_leaves)} leaves, "
+            f"model expects {len(param_leaves)} leaves"
+        )
+
+    restored_leaves: list[jax.Array] = []
+    for leaf_index, (target_leaf, source_leaf) in enumerate(
+        zip(param_leaves, ckpt_leaves)
+    ):
+        target_arr = jnp.asarray(target_leaf)
+        if target_arr.shape != source_leaf.shape:
+            raise ValueError(
+                "Checkpoint shape mismatch at leaf "
+                f"{leaf_index}: checkpoint {source_leaf.shape} vs model {target_arr.shape}"
+            )
+
+        if source_leaf.dtype != target_arr.dtype:
+            source_leaf = source_leaf.astype(target_arr.dtype)
+
+        restored_leaves.append(source_leaf)
+
+    restored_params = jax.tree_util.tree_unflatten(tree_def, restored_leaves)
+    nnx.update(model, restored_params)
+    return len(restored_leaves)
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -927,6 +994,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run train+eval only (useful for non-interactive testing)",
     )
     parser.add_argument(
+        "--chat-only",
+        action="store_true",
+        help="Skip train/eval and start chat after loading --checkpoint-path",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        help="Path to .npz checkpoint with model parameter leaves",
+    )
+    parser.add_argument(
         "--assistant-only-loss",
         action="store_true",
         help=(
@@ -977,6 +1055,10 @@ def main() -> None:
         raise ValueError("--eval-batches must be > 0")
     if args.chat_history_turns <= 0:
         raise ValueError("--chat-history-turns must be > 0")
+    if args.chat_only and not args.checkpoint_path:
+        raise ValueError("--checkpoint-path is required when --chat-only is set")
+    if args.chat_only and args.skip_chat:
+        raise ValueError("--chat-only and --skip-chat cannot be used together")
 
     print("Initializing minimal Nemotron app...")
 
@@ -985,7 +1067,60 @@ def main() -> None:
             "Note: --assistant-only-loss is most useful with role-tagged chat JSONL data."
         )
 
-    # 1) Load text data from selected dataset source.
+    # 1) Load Hugging Face tokenizer.
+    tokenizer = load_hf_tokenizer(
+        tokenizer_name=args.tokenizer_name,
+        cache_dir=args.tokenizer_cache_dir,
+    )
+
+    # 2) Build Nemotron config/model.
+    config = NemotronConfig.from_preset(args.preset)
+    # len(tokenizer) includes any runtime-added special tokens.
+    config.vocab_size = len(tokenizer)
+
+    if args.seq_len % config.mamba_chunk_size != 0:
+        raise ValueError(
+            f"seq_len must be divisible by mamba_chunk_size ({config.mamba_chunk_size})"
+        )
+
+    print(
+        "Model setup: "
+        f"preset={args.preset}, tokenizer={args.tokenizer_name}, "
+        f"vocab_size={config.vocab_size}, "
+        f"seq_len={args.seq_len}, chunk_size={config.mamba_chunk_size}"
+    )
+
+    rngs = nnx.Rngs(args.seed)
+    model = NemotronNanoBlock(rngs=rngs, config=config)
+
+    # Chat-only mode: load checkpoint and jump straight to interactive chat.
+    if args.chat_only:
+        if args.checkpoint_path is None:
+            raise ValueError("--checkpoint-path is required for chat-only mode")
+
+        restored_count = load_checkpoint_into_model(
+            model=model,
+            checkpoint_path=args.checkpoint_path,
+        )
+        print(
+            f"Loaded checkpoint '{args.checkpoint_path}' "
+            f"({restored_count} parameter leaves restored)."
+        )
+
+        chat_loop(
+            model=model,
+            tokenizer=tokenizer,
+            seq_len=args.seq_len,
+            temperature=args.temperature,
+            max_new_tokens=args.max_new_tokens,
+            rng_key=jax.random.PRNGKey(args.seed + 1),
+            user_role_tag=args.user_role_tag,
+            assistant_role_tag=args.assistant_role_tag,
+            history_turns=args.chat_history_turns,
+        )
+        return
+
+    # 3) Load text data from selected dataset source.
     if args.dataset_format == "tinystories":
         all_stories = load_tinystories_texts(
             max_stories=args.tinystories_max_stories,
@@ -1047,32 +1182,6 @@ def main() -> None:
 
             print("\nJSONL preview (first loaded sample):")
             print(f"  {preview}")
-
-    # 2) Load Hugging Face tokenizer.
-    tokenizer = load_hf_tokenizer(
-        tokenizer_name=args.tokenizer_name,
-        cache_dir=args.tokenizer_cache_dir,
-    )
-
-    # 3) Build Nemotron config/model.
-    config = NemotronConfig.from_preset(args.preset)
-    # len(tokenizer) includes any runtime-added special tokens.
-    config.vocab_size = len(tokenizer)
-
-    if args.seq_len % config.mamba_chunk_size != 0:
-        raise ValueError(
-            f"seq_len must be divisible by mamba_chunk_size ({config.mamba_chunk_size})"
-        )
-
-    print(
-        "Model setup: "
-        f"preset={args.preset}, tokenizer={args.tokenizer_name}, "
-        f"vocab_size={config.vocab_size}, "
-        f"seq_len={args.seq_len}, chunk_size={config.mamba_chunk_size}"
-    )
-
-    rngs = nnx.Rngs(args.seed)
-    model = NemotronNanoBlock(rngs=rngs, config=config)
 
     # Build optimizer: AdamW with warmup + cosine decay
     max_steps = max(args.steps, 1)
