@@ -94,6 +94,35 @@ python app.py \
    --tokenizer-name google/byt5-small
 ```
 
+### Conversation Dataset (OASST2 -> JSONL)
+
+To train on multi-turn chat data with minimal pipeline changes:
+
+1. Convert OASST2 into role-formatted JSONL files:
+
+```bash
+python scripts/convert_oasst2_to_jsonl.py \
+   --out-dir data/oasst2 \
+   --lang en
+```
+
+2. Train with JSONL dataset mode:
+
+```bash
+python app.py \
+   --dataset-format jsonl \
+   --train-jsonl data/oasst2/train.jsonl \
+   --val-jsonl data/oasst2/val.jsonl \
+   --jsonl-text-key serialized_text \
+   --steps 80 \
+   --batch-size 8 \
+   --seq-len 64 \
+   --skip-chat
+```
+
+`app.py` still supports TinyStories by default. JSONL mode only changes where
+the text comes from; the training objective and model pipeline remain unchanged.
+
 **What happens in `app.py`:**
 
 1. **Data Loading**: Loads TinyStories dataset
