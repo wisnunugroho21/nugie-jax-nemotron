@@ -157,6 +157,13 @@ mask-debug supervised=320.0/512 ratio=0.6250
 This helps verify that new datasets still contain enough assistant-supervised
 tokens after role-tag parsing.
 
+At the end of training, it also prints a compact one-line summary across all
+batches:
+
+```text
+Mask ratio summary min=0.4121 max=0.7031 mean=0.5984
+```
+
 **What happens in `app.py`:**
 
 1. **Data Loading**: Loads TinyStories dataset

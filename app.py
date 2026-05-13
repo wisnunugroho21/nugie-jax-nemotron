@@ -542,6 +542,8 @@ def train_model(
     if debug_mask_every <= 0:
         raise ValueError("debug_mask_every must be > 0")
 
+    mask_ratios: list[float] = []
+
     @nnx.jit
     def train_step(
         model: NemotronNanoBlock,
@@ -576,15 +578,28 @@ def train_model(
         total_loss = train_step(model, optimizer, x_batch, y_batch, y_mask_batch)
 
         print(f"  step {step + 1:>3}/{steps} | ce={float(total_loss):.4f}")
-        if debug_mask_ratio and ((step + 1) % debug_mask_every == 0):
+        if debug_mask_ratio:
             supervised_tokens = float(jnp.sum(y_mask_batch))
             total_tokens = int(y_mask_batch.size)
             ratio = supervised_tokens / max(total_tokens, 1)
+            mask_ratios.append(ratio)
+        if debug_mask_ratio and ((step + 1) % debug_mask_every == 0):
             print(
                 "    mask-debug "
                 f"supervised={supervised_tokens:.1f}/{total_tokens} "
                 f"ratio={ratio:.4f}"
             )
+
+    if debug_mask_ratio and mask_ratios:
+        ratio_min = min(mask_ratios)
+        ratio_max = max(mask_ratios)
+        ratio_mean = sum(mask_ratios) / len(mask_ratios)
+        print(
+            "Mask ratio summary "
+            f"min={ratio_min:.4f} "
+            f"max={ratio_max:.4f} "
+            f"mean={ratio_mean:.4f}"
+        )
 
     return rng_key
 
