@@ -82,6 +82,28 @@ pip install jax flax optax datasets transformers
 
 ## 🚀 Usage
 
+### Jupyter Notebook and Google Colab
+
+Use the ready notebook at `notebooks/nemotron_jupyter_colab.ipynb`.
+
+Local Jupyter:
+
+```bash
+jupyter notebook notebooks/nemotron_jupyter_colab.ipynb
+```
+
+Google Colab:
+
+1. Open Colab and upload `notebooks/nemotron_jupyter_colab.ipynb`.
+2. Run all cells from top to bottom.
+3. In the config cell, switch `dataset_format` to:
+   - `"tinystories"` for direct Hugging Face streaming, or
+   - `"jsonl"` to train from local/Drive JSONL files.
+
+Notes:
+- The notebook uses the same training functions as `app.py` (`prepare_datasets`, `train_model`, `evaluate_model`, `generate_reply`).
+- For chat SFT-style runs in notebook/Colab, enable `assistant_only_loss=True` in the config cell.
+
 ### Training & Evaluation
 
 Run the full pipeline (load data → train → evaluate → chat):
