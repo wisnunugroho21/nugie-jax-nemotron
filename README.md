@@ -181,7 +181,8 @@ This implementation is inspired by:
 4. **RoPE**: "RoFormer: Enhanced Transformer with Rotary Position Embedding"  
    [arXiv:2104.09864](https://arxiv.org/abs/2104.09864)
 
-5. **MoE Designs**: DeepSeekMoE, Mixture of Experts (GShard, Switch Transformers)
+5. **MoE Designs**: "DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models", Mixture of Experts (GShard, Switch Transformers)  
+   [arXiv:2401.06066](https://arxiv.org/abs/2401.06066)
 
 ---
 
