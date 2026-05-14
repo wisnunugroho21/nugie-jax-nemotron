@@ -588,12 +588,13 @@ def train_model(
             total_tokens = int(y_mask_batch.size)
             ratio = supervised_tokens / max(total_tokens, 1)
             mask_ratios.append(ratio)
-        if debug_mask_ratio and ((step + 1) % debug_mask_every == 0):
-            print(
-                "    mask-debug "
-                f"supervised={supervised_tokens:.1f}/{total_tokens} "
-                f"ratio={ratio:.4f}"
-            )
+            
+            if ((step + 1) % debug_mask_every == 0):
+                print(
+                    "    mask-debug "
+                    f"supervised={supervised_tokens:.1f}/{total_tokens} "
+                    f"ratio={ratio:.4f}"
+                )
 
     if debug_mask_ratio and mask_ratios:
         ratio_min = min(mask_ratios)
