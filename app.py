@@ -19,6 +19,7 @@ import argparse
 import datetime
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -297,29 +298,352 @@ def split_train_val_texts(
     return train_texts, val_texts
 
 
-def load_synthetic_multimodal_texts(
-    max_records: int,
-) -> tuple[list[str], list[str]]:
-    """
-    Builds tiny synthetic instruction-response texts for multimodal smoke tests.
+@dataclass
+class MultimodalExample:
+    """One preprocessed multimodal training example."""
 
-    This avoids external dataset dependencies when verifying VLM/VLA plumbing.
-    """
-    if max_records < 10:
-        raise ValueError("max_records must be at least 10 for synthetic dataset")
+    token_ids: np.ndarray
+    text_labels: np.ndarray
+    text_loss_mask: np.ndarray
+    pixel_values: np.ndarray
+    action_label: int | None
 
-    records: list[str] = []
-    for idx in range(max_records):
-        color = ["red", "blue", "green", "yellow"][idx % 4]
-        action = ["pick", "push", "pull", "place"][idx % 4]
-        records.append(
-            f"<|user|>\nWhat should the robot do with the {color} block?\n"
-            f"<|assistant|>\nThe robot should {action} the {color} block safely."
+
+def _encode_text_for_multimodal_example(
+    tokenizer: "PreTrainedTokenizerBase",
+    text: str,
+    text_seq_len: int,
+    assistant_only_loss: bool,
+    user_role_tag: str,
+    assistant_role_tag: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Converts one text sample to fixed-length next-token arrays.
+
+    Output arrays all use length `text_seq_len`:
+    - token_ids      : input IDs
+    - text_labels    : shifted labels
+    - text_loss_mask : shifted supervision mask
+    """
+    if text_seq_len <= 0:
+        raise ValueError("text_seq_len must be > 0")
+
+    pad_id, bos_id, eos_id = _get_special_token_ids(tokenizer)
+    if assistant_only_loss:
+        ids, mask = encode_text_with_assistant_mask(
+            tokenizer=tokenizer,
+            text=text,
+            user_role_tag=user_role_tag,
+            assistant_role_tag=assistant_role_tag,
+        )
+        ids = [bos_id] + ids + [eos_id]
+        mask = [0.0] + mask + [0.0]
+    else:
+        ids = encode_text(tokenizer, text, add_bos=True, add_eos=True)
+        mask = [1.0] * len(ids)
+
+    target_len = text_seq_len + 1
+    if len(ids) >= target_len:
+        ids = ids[-target_len:]
+        mask = mask[-target_len:]
+    else:
+        pad_count = target_len - len(ids)
+        ids = [pad_id] * pad_count + ids
+        mask = [0.0] * pad_count + mask
+
+    ids_arr = np.asarray(ids, dtype=np.int32)
+    mask_arr = np.asarray(mask, dtype=np.float32)
+
+    token_ids = ids_arr[:-1]
+    text_labels = ids_arr[1:]
+    text_loss_mask = mask_arr[1:]
+    return token_ids, text_labels, text_loss_mask
+
+
+def _load_image_array(
+    image_path: Path,
+    image_size: int,
+    image_channels: int,
+) -> np.ndarray:
+    """Loads and normalizes one image to (H, W, C), float32 in [-1, 1]."""
+    suffix = image_path.suffix.lower()
+    if suffix == ".npy":
+        image = np.load(image_path)
+    else:
+        try:
+            from PIL import Image  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "Image loading for non-.npy files requires Pillow. "
+                "Install it with: pip install pillow"
+            ) from exc
+
+        with Image.open(image_path) as img:
+            if image_channels == 3:
+                img = img.convert("RGB")
+            elif image_channels == 1:
+                img = img.convert("L")
+            else:
+                raise ValueError("Only image_channels=1 or 3 are currently supported")
+            img = img.resize((image_size, image_size))
+            image = np.asarray(img)
+
+    if image.ndim == 2:
+        image = image[..., None]
+    if image.ndim != 3:
+        raise ValueError(f"Image must decode to rank-3 array, got shape {image.shape}")
+
+    if image.shape[-1] != image_channels:
+        raise ValueError(
+            f"Image channel mismatch for {image_path}: "
+            f"expected {image_channels}, got {image.shape[-1]}"
         )
 
-    split_index = max(1, int(0.9 * len(records)))
-    split_index = min(split_index, len(records) - 1)
-    return records[:split_index], records[split_index:]
+    if image.shape[0] != image_size or image.shape[1] != image_size:
+        # npy inputs are not resized automatically to keep behavior explicit.
+        raise ValueError(
+            f"Image spatial size mismatch for {image_path}: expected "
+            f"({image_size}, {image_size}), got ({image.shape[0]}, {image.shape[1]})"
+        )
+
+    image_f32 = image.astype(np.float32)
+    if image_f32.max() > 1.0 or image_f32.min() < -1.0:
+        image_f32 = (image_f32 / 127.5) - 1.0
+
+    return image_f32
+
+
+def load_multimodal_jsonl_examples(
+    jsonl_path: str,
+    max_records: int,
+    tokenizer: "PreTrainedTokenizerBase",
+    text_seq_len: int,
+    image_size: int,
+    image_channels: int,
+    text_key: str,
+    image_key: str,
+    action_key: str,
+    image_root: str | None,
+    assistant_only_loss: bool,
+    user_role_tag: str,
+    assistant_role_tag: str,
+    require_action: bool,
+) -> list[MultimodalExample]:
+    """Loads real multimodal JSONL data into preprocessed examples."""
+    if max_records <= 0:
+        raise ValueError("max_records must be > 0")
+
+    path = Path(jsonl_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Multimodal JSONL file not found: {jsonl_path}")
+
+    root_path = Path(image_root) if image_root else path.parent
+
+    examples: list[MultimodalExample] = []
+    with path.open("r", encoding="utf-8") as infile:
+        for line_number, line in enumerate(infile, start=1):
+            if len(examples) >= max_records:
+                break
+
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSON in {jsonl_path} at line {line_number}"
+                ) from exc
+
+            if not isinstance(obj, dict):
+                continue
+
+            raw_text = obj.get(text_key)
+            raw_image = obj.get(image_key)
+            if not isinstance(raw_text, str) or not raw_text.strip():
+                continue
+            if not isinstance(raw_image, str) or not raw_image.strip():
+                continue
+
+            image_path = Path(raw_image)
+            if not image_path.is_absolute():
+                image_path = (root_path / image_path).resolve()
+            if not image_path.exists():
+                raise FileNotFoundError(
+                    f"Image file not found at line {line_number}: {image_path}"
+                )
+
+            action_label: int | None = None
+            if action_key in obj and obj.get(action_key) is not None:
+                raw_action = obj.get(action_key)
+                if isinstance(raw_action, (int, np.integer)):
+                    action_label = int(raw_action)
+                elif isinstance(raw_action, str) and raw_action.strip().isdigit():
+                    action_label = int(raw_action.strip())
+                else:
+                    raise ValueError(
+                        f"Invalid action value at line {line_number}: {raw_action!r}"
+                    )
+
+            if require_action and action_label is None:
+                raise ValueError(
+                    f"Missing required action label '{action_key}' at line {line_number}"
+                )
+
+            token_ids, text_labels, text_loss_mask = _encode_text_for_multimodal_example(
+                tokenizer=tokenizer,
+                text=raw_text,
+                text_seq_len=text_seq_len,
+                assistant_only_loss=assistant_only_loss,
+                user_role_tag=user_role_tag,
+                assistant_role_tag=assistant_role_tag,
+            )
+            pixel_values = _load_image_array(
+                image_path=image_path,
+                image_size=image_size,
+                image_channels=image_channels,
+            )
+            examples.append(
+                MultimodalExample(
+                    token_ids=token_ids,
+                    text_labels=text_labels,
+                    text_loss_mask=text_loss_mask,
+                    pixel_values=pixel_values,
+                    action_label=action_label,
+                )
+            )
+
+    if len(examples) < 2:
+        raise ValueError(
+            f"Need at least 2 valid multimodal records in {jsonl_path}; got {len(examples)}"
+        )
+
+    return examples
+
+
+def validate_multimodal_jsonl_integrity(
+    jsonl_path: str,
+    image_size: int,
+    image_channels: int,
+    text_key: str,
+    image_key: str,
+    action_key: str,
+    image_root: str | None,
+    require_action: bool,
+    max_reported_errors: int = 8,
+) -> dict[str, int]:
+    """
+    Validates multimodal JSONL records before training.
+
+    Checks include:
+    - JSON parse validity and object structure
+    - Required text/image keys and non-empty values
+    - Required action label (for VLA) and integer parseability
+    - Image file existence and shape/channel compatibility
+    """
+    if max_reported_errors <= 0:
+        raise ValueError("max_reported_errors must be > 0")
+
+    path = Path(jsonl_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Multimodal JSONL file not found: {jsonl_path}")
+
+    root_path = Path(image_root) if image_root else path.parent
+
+    total_lines = 0
+    valid_records = 0
+    skipped_blank = 0
+    errors: list[str] = []
+
+    def record_error(msg: str) -> None:
+        if len(errors) < max_reported_errors:
+            errors.append(msg)
+
+    with path.open("r", encoding="utf-8") as infile:
+        for line_number, line in enumerate(infile, start=1):
+            total_lines += 1
+            stripped = line.strip()
+            if not stripped:
+                skipped_blank += 1
+                continue
+
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                record_error(f"line {line_number}: invalid JSON ({exc.msg})")
+                continue
+
+            if not isinstance(obj, dict):
+                record_error(f"line {line_number}: expected JSON object")
+                continue
+
+            raw_text = obj.get(text_key)
+            if not isinstance(raw_text, str) or not raw_text.strip():
+                record_error(
+                    f"line {line_number}: missing/empty text key '{text_key}'"
+                )
+                continue
+
+            raw_image = obj.get(image_key)
+            if not isinstance(raw_image, str) or not raw_image.strip():
+                record_error(
+                    f"line {line_number}: missing/empty image key '{image_key}'"
+                )
+                continue
+
+            action_value = obj.get(action_key)
+            if require_action and action_value is None:
+                record_error(
+                    f"line {line_number}: missing required action key '{action_key}'"
+                )
+                continue
+
+            if action_value is not None:
+                is_int = isinstance(action_value, (int, np.integer))
+                is_digit_string = (
+                    isinstance(action_value, str) and action_value.strip().isdigit()
+                )
+                if not (is_int or is_digit_string):
+                    record_error(
+                        f"line {line_number}: invalid action value for '{action_key}'"
+                    )
+                    continue
+
+            image_path = Path(raw_image)
+            if not image_path.is_absolute():
+                image_path = (root_path / image_path).resolve()
+
+            if not image_path.exists():
+                record_error(f"line {line_number}: image file missing at {image_path}")
+                continue
+
+            try:
+                _load_image_array(
+                    image_path=image_path,
+                    image_size=image_size,
+                    image_channels=image_channels,
+                )
+            except Exception as exc:
+                record_error(f"line {line_number}: image validation failed ({exc})")
+                continue
+
+            valid_records += 1
+
+    if errors:
+        summary = (
+            f"Multimodal JSONL integrity check failed for {jsonl_path}. "
+            f"valid_records={valid_records}, total_lines={total_lines}, "
+            f"blank_lines={skipped_blank}."
+        )
+        details = "\n".join(f"- {item}" for item in errors)
+        raise ValueError(f"{summary}\n{details}")
+
+    return {
+        "total_lines": total_lines,
+        "blank_lines": skipped_blank,
+        "valid_records": valid_records,
+    }
 
 
 def load_jsonl_texts(
@@ -507,7 +831,7 @@ def create_lr_schedule(
     )
 
 
-def _update_all_expert_biases(model: NemotronNanoBlock) -> None:
+def _update_all_expert_biases(model: NemotronNanoBlock | NemotronMultimodal) -> None:
     """
     Update expert biases across every MoE layer after a training step.
 
@@ -562,56 +886,47 @@ def sample_lm_batch(
 
 
 def sample_multimodal_batch(
-    token_stream: jax.Array,
-    loss_mask_stream: jax.Array,
+    examples: list[MultimodalExample],
     batch_size: int,
-    text_seq_len: int,
     rng_key: jax.Array,
-    image_size: int,
-    image_channels: int,
     task_type: str,
-    action_vocab_size: int,
 ) -> HybridBatch:
     """
-    Samples text windows and synthetic image/action tensors for multimodal training.
-
-    Synthetic image tensors keep wiring simple and deterministic for integration
-    checks; real image datasets can replace this sampler later.
+    Samples a random multimodal minibatch from preloaded examples.
     """
     if task_type not in {"vlm", "vla"}:
         raise ValueError("task_type must be 'vlm' or 'vla'")
+    if len(examples) == 0:
+        raise ValueError("examples must be non-empty")
 
-    x_batch, y_batch, y_mask_batch = sample_lm_batch(
-        token_stream=token_stream,
-        loss_mask_stream=loss_mask_stream,
-        batch_size=batch_size,
-        seq_len=text_seq_len,
-        rng_key=rng_key,
+    indices = jax.random.randint(
+        rng_key,
+        shape=(batch_size,),
+        minval=0,
+        maxval=len(examples),
     )
+    selected = [examples[int(i)] for i in indices.tolist()]
 
-    image_key, noise_key = jax.random.split(rng_key)
-    # Structured synthetic images (signal + noise) for smoke testing.
-    base = jax.random.uniform(
-        image_key,
-        (batch_size, image_size, image_size, image_channels),
-        minval=-1.0,
-        maxval=1.0,
+    token_ids = jnp.asarray(np.stack([ex.token_ids for ex in selected], axis=0))
+    text_labels = jnp.asarray(np.stack([ex.text_labels for ex in selected], axis=0))
+    text_loss_mask = jnp.asarray(
+        np.stack([ex.text_loss_mask for ex in selected], axis=0)
     )
-    noise = 0.05 * jax.random.normal(
-        noise_key,
-        (batch_size, image_size, image_size, image_channels),
-    )
-    pixel_values = (base + noise).astype(jnp.float32)
+    pixel_values = jnp.asarray(np.stack([ex.pixel_values for ex in selected], axis=0))
 
-    action_labels: jax.Array | None = None
+    action_labels: jax.Array | None
     if task_type == "vla":
-        # Simple deterministic target from token stream for stable smoke checks.
-        action_labels = jnp.mod(y_batch[:, -1], action_vocab_size).astype(jnp.int32)
+        maybe_actions = [ex.action_label for ex in selected]
+        if any(action is None for action in maybe_actions):
+            raise ValueError("VLA batch contains missing action_label values")
+        action_labels = jnp.asarray(maybe_actions, dtype=jnp.int32)
+    else:
+        action_labels = None
 
     return HybridBatch(
-        token_ids=x_batch,
-        text_labels=y_batch,
-        text_loss_mask=y_mask_batch,
+        token_ids=token_ids,
+        text_labels=text_labels,
+        text_loss_mask=text_loss_mask,
         pixel_values=pixel_values,
         action_labels=action_labels,
         action_positions=None,
@@ -702,15 +1017,10 @@ def train_model(
 def train_model_multimodal(
     model: NemotronMultimodal,
     optimizer: nnx.Optimizer,
-    train_tokens: jax.Array,
-    train_loss_mask: jax.Array,
+    train_examples: list[MultimodalExample],
     steps: int,
     batch_size: int,
-    text_seq_len: int,
-    image_size: int,
-    image_channels: int,
     task_type: str,
-    action_vocab_size: int,
     rng_key: jax.Array,
 ) -> jax.Array:
     """Runs multimodal training with text-only or text+action loss."""
@@ -732,6 +1042,8 @@ def train_model_multimodal(
                 return_dict=True,
                 return_action_logits=(task_type == "vla"),
             )
+            if not isinstance(outputs, dict):
+                raise TypeError("Expected dict outputs in multimodal train_step")
             text_logits = outputs["text"]
             action_logits = outputs.get("action")
 
@@ -756,15 +1068,10 @@ def train_model_multimodal(
     for step in range(steps):
         rng_key, batch_key = jax.random.split(rng_key)
         batch = sample_multimodal_batch(
-            token_stream=train_tokens,
-            loss_mask_stream=train_loss_mask,
+            examples=train_examples,
             batch_size=batch_size,
-            text_seq_len=text_seq_len,
             rng_key=batch_key,
-            image_size=image_size,
-            image_channels=image_channels,
             task_type=task_type,
-            action_vocab_size=action_vocab_size,
         )
         total_loss, action_loss = train_step(
             model=model,
@@ -776,10 +1083,7 @@ def train_model_multimodal(
             else jnp.ones_like(batch.text_labels, dtype=jnp.float32),
             pixel_values=batch.pixel_values
             if batch.pixel_values is not None
-            else jnp.zeros(
-                (batch_size, image_size, image_size, image_channels),
-                dtype=jnp.float32,
-            ),
+            else jnp.zeros((batch_size, 1, 1, 3), dtype=jnp.float32),
             action_labels=batch.action_labels,
         )
 
@@ -833,15 +1137,10 @@ def evaluate_model(
 
 def evaluate_model_multimodal(
     model: NemotronMultimodal,
-    val_tokens: jax.Array,
-    val_loss_mask: jax.Array,
+    val_examples: list[MultimodalExample],
     batch_size: int,
-    text_seq_len: int,
     eval_batches: int,
-    image_size: int,
-    image_channels: int,
     task_type: str,
-    action_vocab_size: int,
     rng_key: jax.Array,
 ) -> tuple[float, float, jax.Array]:
     """
@@ -854,15 +1153,10 @@ def evaluate_model_multimodal(
     for _ in range(eval_batches):
         rng_key, batch_key = jax.random.split(rng_key)
         batch = sample_multimodal_batch(
-            token_stream=val_tokens,
-            loss_mask_stream=val_loss_mask,
+            examples=val_examples,
             batch_size=batch_size,
-            text_seq_len=text_seq_len,
             rng_key=batch_key,
-            image_size=image_size,
-            image_channels=image_channels,
             task_type=task_type,
-            action_vocab_size=action_vocab_size,
         )
 
         outputs = model(
@@ -871,6 +1165,8 @@ def evaluate_model_multimodal(
             return_dict=True,
             return_action_logits=(task_type == "vla"),
         )
+        if not isinstance(outputs, dict):
+            raise TypeError("Expected dict outputs in multimodal evaluate")
         total_loss, _ = compute_hybrid_loss(
             text_logits=outputs["text"],
             text_labels=batch.text_labels,
@@ -926,7 +1222,7 @@ def sample_next_token(
 
 
 def generate_reply(
-    model: NemotronNanoBlock,
+    model: NemotronNanoBlock | NemotronMultimodal,
     tokenizer: "PreTrainedTokenizerBase",
     prompt_text: str,
     seq_len: int,
@@ -943,6 +1239,10 @@ def generate_reply(
     for _ in range(max_new_tokens):
         model_input = pad_or_trim_context(context_ids, seq_len, pad_id)
         logits = model(model_input)
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        elif isinstance(logits, dict):
+            logits = logits["text"]
 
         next_logits = logits[0, -1]
 
@@ -989,7 +1289,7 @@ def build_chat_prompt(
 
 
 def chat_loop(
-    model: NemotronNanoBlock,
+    model: NemotronNanoBlock | NemotronMultimodal,
     tokenizer: "PreTrainedTokenizerBase",
     seq_len: int,
     temperature: float,
@@ -1099,7 +1399,7 @@ def save_checkpoint_from_model(
     metadata = _collect_checkpoint_metadata(model)
     payload["__metadata_json__"] = np.asarray(json.dumps(metadata), dtype=np.str_)
 
-    np.savez(path, **payload)
+    np.savez(str(path), **payload)  # type: ignore[arg-type]
     return len(param_leaves)
 
 
@@ -1334,14 +1634,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dataset-format",
         type=str,
         default="tinystories",
-        choices=["tinystories", "jsonl", "synthetic_mm"],
+        choices=["tinystories", "jsonl", "multimodal_jsonl"],
         help="Dataset source format: TinyStories streaming or local JSONL files",
-    )
-    parser.add_argument(
-        "--synthetic-mm-records",
-        type=int,
-        default=200,
-        help="Number of synthetic records when --dataset-format=synthetic_mm",
     )
     parser.add_argument(
         "--train-jsonl",
@@ -1372,6 +1666,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=5000,
         help="Max validation records to read from val JSONL",
+    )
+    parser.add_argument(
+        "--multimodal-text-key",
+        type=str,
+        default="serialized_text",
+        help="JSON key for text in multimodal_jsonl records",
+    )
+    parser.add_argument(
+        "--multimodal-image-key",
+        type=str,
+        default="image_path",
+        help="JSON key for image path in multimodal_jsonl records",
+    )
+    parser.add_argument(
+        "--multimodal-action-key",
+        type=str,
+        default="action_id",
+        help="JSON key for action label in multimodal_jsonl records",
+    )
+    parser.add_argument(
+        "--multimodal-image-root",
+        type=str,
+        default=None,
+        help="Optional root directory used to resolve relative image paths in multimodal_jsonl",
+    )
+    parser.add_argument(
+        "--validate-multimodal-jsonl",
+        action="store_true",
+        help="Run multimodal JSONL integrity checks (keys, image files, shapes) before training",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Run validation checks and exit without training/evaluation",
     )
     parser.add_argument(
         "--tokenizer-name",
@@ -1474,8 +1802,20 @@ def main() -> None:
         raise ValueError("--chat-only and --skip-chat cannot be used together")
     if args.vision_in_channels <= 0:
         raise ValueError("--vision-in-channels must be > 0")
-    if args.model_mode == "text" and args.dataset_format == "synthetic_mm":
-        raise ValueError("--dataset-format=synthetic_mm requires --model-mode=vlm or vla")
+    if args.model_mode == "text" and args.dataset_format == "multimodal_jsonl":
+        raise ValueError(
+            "--dataset-format=multimodal_jsonl requires --model-mode=vlm or vla"
+        )
+    if args.model_mode in {"vlm", "vla"} and args.dataset_format != "multimodal_jsonl":
+        raise ValueError(
+            "--model-mode=vlm/vla requires --dataset-format=multimodal_jsonl"
+        )
+    if args.validate_multimodal_jsonl and args.dataset_format != "multimodal_jsonl":
+        raise ValueError(
+            "--validate-multimodal-jsonl requires --dataset-format=multimodal_jsonl"
+        )
+    if args.validate_only and not args.validate_multimodal_jsonl:
+        raise ValueError("--validate-only requires --validate-multimodal-jsonl")
 
     print("Initializing minimal Nemotron app...")
 
@@ -1591,7 +1931,12 @@ def main() -> None:
             f"({restored_count} parameter leaves restored)."
         )
 
-    # 3) Load text data from selected dataset source.
+    # 3) Load data from selected dataset source.
+    train_texts: list[str] = []
+    val_texts: list[str] = []
+    train_examples_mm: list[MultimodalExample] | None = None
+    val_examples_mm: list[MultimodalExample] | None = None
+
     if args.dataset_format == "tinystories":
         all_stories = load_tinystories_texts(
             max_stories=args.tinystories_max_stories,
@@ -1654,14 +1999,83 @@ def main() -> None:
             print("\nJSONL preview (first loaded sample):")
             print(f"  {preview}")
     else:
-        train_texts, val_texts = load_synthetic_multimodal_texts(
-            max_records=args.synthetic_mm_records,
+        if not args.train_jsonl or not args.val_jsonl:
+            raise ValueError(
+                "--train-jsonl and --val-jsonl are required when --dataset-format=multimodal_jsonl"
+            )
+        if active_mm_config is None:
+            raise RuntimeError("Internal error: multimodal config missing")
+
+        if args.validate_multimodal_jsonl:
+            train_stats = validate_multimodal_jsonl_integrity(
+                jsonl_path=args.train_jsonl,
+                image_size=active_mm_config.image_size,
+                image_channels=active_mm_config.vision_in_channels,
+                text_key=args.multimodal_text_key,
+                image_key=args.multimodal_image_key,
+                action_key=args.multimodal_action_key,
+                image_root=args.multimodal_image_root,
+                require_action=(task_type == "vla"),
+            )
+            val_stats = validate_multimodal_jsonl_integrity(
+                jsonl_path=args.val_jsonl,
+                image_size=active_mm_config.image_size,
+                image_channels=active_mm_config.vision_in_channels,
+                text_key=args.multimodal_text_key,
+                image_key=args.multimodal_image_key,
+                action_key=args.multimodal_action_key,
+                image_root=args.multimodal_image_root,
+                require_action=(task_type == "vla"),
+            )
+            print(
+                "Multimodal JSONL validation passed: "
+                f"train_valid={train_stats['valid_records']}, "
+                f"val_valid={val_stats['valid_records']}"
+            )
+            if args.validate_only:
+                print("Validation-only mode complete. Exiting before training.")
+                return
+
+        train_examples_mm = load_multimodal_jsonl_examples(
+            jsonl_path=args.train_jsonl,
+            max_records=args.jsonl_max_train_records,
+            tokenizer=tokenizer,
+            text_seq_len=train_text_seq_len,
+            image_size=active_mm_config.image_size,
+            image_channels=active_mm_config.vision_in_channels,
+            text_key=args.multimodal_text_key,
+            image_key=args.multimodal_image_key,
+            action_key=args.multimodal_action_key,
+            image_root=args.multimodal_image_root,
+            assistant_only_loss=args.assistant_only_loss,
+            user_role_tag=args.user_role_tag,
+            assistant_role_tag=args.assistant_role_tag,
+            require_action=(task_type == "vla"),
+        )
+        val_examples_mm = load_multimodal_jsonl_examples(
+            jsonl_path=args.val_jsonl,
+            max_records=args.jsonl_max_val_records,
+            tokenizer=tokenizer,
+            text_seq_len=train_text_seq_len,
+            image_size=active_mm_config.image_size,
+            image_channels=active_mm_config.vision_in_channels,
+            text_key=args.multimodal_text_key,
+            image_key=args.multimodal_image_key,
+            action_key=args.multimodal_action_key,
+            image_root=args.multimodal_image_root,
+            assistant_only_loss=args.assistant_only_loss,
+            user_role_tag=args.user_role_tag,
+            assistant_role_tag=args.assistant_role_tag,
+            require_action=(task_type == "vla"),
         )
         print(
             "Dataset setup: "
-            "source=synthetic_mm, "
-            f"train_records={len(train_texts)}, "
-            f"val_records={len(val_texts)}"
+            "source=multimodal_jsonl, "
+            f"train_records={len(train_examples_mm)}, "
+            f"val_records={len(val_examples_mm)}, "
+            f"text_key={args.multimodal_text_key}, "
+            f"image_key={args.multimodal_image_key}, "
+            f"action_key={args.multimodal_action_key}"
         )
 
     # Build optimizer: AdamW with warmup + cosine decay
@@ -1681,37 +2095,42 @@ def main() -> None:
     # Use a separate key stream for data/generation randomness.
     rng_key = jax.random.PRNGKey(args.seed + 1)
 
-    # 4) Prepare token streams from train/validation stories.
-    train_tokens, val_tokens, train_loss_mask, val_loss_mask = prepare_datasets(
-        tokenizer=tokenizer,
-        train_texts=train_texts,
-        val_texts=val_texts,
-        seq_len=train_text_seq_len,
-        assistant_only_loss=args.assistant_only_loss,
-        user_role_tag=args.user_role_tag,
-        assistant_role_tag=args.assistant_role_tag,
-    )
+    train_tokens: jax.Array | None = None
+    val_tokens: jax.Array | None = None
+    train_loss_mask: jax.Array | None = None
+    val_loss_mask: jax.Array | None = None
+
+    if args.dataset_format != "multimodal_jsonl":
+        # 4) Prepare token streams from train/validation text samples.
+        train_tokens, val_tokens, train_loss_mask, val_loss_mask = prepare_datasets(
+            tokenizer=tokenizer,
+            train_texts=train_texts,
+            val_texts=val_texts,
+            seq_len=train_text_seq_len,
+            assistant_only_loss=args.assistant_only_loss,
+            user_role_tag=args.user_role_tag,
+            assistant_role_tag=args.assistant_role_tag,
+        )
 
     # 5) Train.
     if isinstance(model, NemotronMultimodal):
         if active_mm_config is None:
             raise RuntimeError("Internal error: multimodal config missing")
+        if train_examples_mm is None:
+            raise RuntimeError("Multimodal training examples are missing")
 
         rng_key = train_model_multimodal(
             model=model,
             optimizer=optimizer,
-            train_tokens=train_tokens,
-            train_loss_mask=train_loss_mask,
+            train_examples=train_examples_mm,
             steps=args.steps,
             batch_size=args.batch_size,
-            text_seq_len=train_text_seq_len,
-            image_size=active_mm_config.image_size,
-            image_channels=active_mm_config.vision_in_channels,
             task_type=task_type,
-            action_vocab_size=active_mm_config.action_vocab_size,
             rng_key=rng_key,
         )
     else:
+        if train_tokens is None or train_loss_mask is None:
+            raise RuntimeError("Text training streams are missing")
         rng_key = train_model(
             model=model,
             optimizer=optimizer,
@@ -1729,21 +2148,20 @@ def main() -> None:
     if isinstance(model, NemotronMultimodal):
         if active_mm_config is None:
             raise RuntimeError("Internal error: multimodal config missing")
+        if val_examples_mm is None:
+            raise RuntimeError("Multimodal validation examples are missing")
 
         mean_ce, perplexity, rng_key = evaluate_model_multimodal(
             model=model,
-            val_tokens=val_tokens,
-            val_loss_mask=val_loss_mask,
+            val_examples=val_examples_mm,
             batch_size=args.batch_size,
-            text_seq_len=train_text_seq_len,
             eval_batches=args.eval_batches,
-            image_size=active_mm_config.image_size,
-            image_channels=active_mm_config.vision_in_channels,
             task_type=task_type,
-            action_vocab_size=active_mm_config.action_vocab_size,
             rng_key=rng_key,
         )
     else:
+        if val_tokens is None or val_loss_mask is None:
+            raise RuntimeError("Text validation streams are missing")
         mean_ce, perplexity, rng_key = evaluate_model(
             model=model,
             val_tokens=val_tokens,

@@ -245,24 +245,51 @@ The repository now includes an early multimodal adapter path:
 
 Current status:
 - Core multimodal modules are implemented and importable.
-- VLM mode now trains/evaluates with synthetic image tensors through the vision path.
+- VLM mode now trains/evaluates from real multimodal JSONL records.
 - VLA mode now trains/evaluates with joint text + action loss.
-- Synthetic multimodal smoke data is available via `--dataset-format synthetic_mm`.
+- Multimodal data loading uses `--dataset-format multimodal_jsonl`.
 
-Quick smoke commands:
+Expected multimodal JSONL schema (one object per line):
+
+```json
+{
+  "serialized_text": "<|user|>\nDescribe this scene\n<|assistant|>\n...",
+  "image_path": "images/sample_001.png",
+  "action_id": 3
+}
+```
+
+Quick run commands:
 
 ```bash
-# Vision-language smoke train/eval
+# Validate multimodal files/keys/shapes and exit (no training)
+python app.py \
+   --model-mode vla \
+   --dataset-format multimodal_jsonl \
+   --train-jsonl data/mm_train.jsonl \
+   --val-jsonl data/mm_val.jsonl \
+   --multimodal-image-root data \
+   --validate-multimodal-jsonl \
+   --validate-only \
+   --steps 1 --eval-batches 1 --batch-size 2 --seq-len 64 --skip-chat
+
+# Vision-language run with real multimodal records
 python app.py \
    --model-mode vlm \
-   --dataset-format synthetic_mm \
+   --dataset-format multimodal_jsonl \
+   --train-jsonl data/mm_train.jsonl \
+   --val-jsonl data/mm_val.jsonl \
+   --multimodal-image-root data \
    --steps 1 --eval-batches 1 --batch-size 2 \
    --seq-len 64 --skip-chat
 
-# Vision-language-action smoke train/eval + save versioned checkpoint
+# Vision-language-action run + save versioned checkpoint
 python app.py \
    --model-mode vla \
-   --dataset-format synthetic_mm \
+   --dataset-format multimodal_jsonl \
+   --train-jsonl data/mm_train.jsonl \
+   --val-jsonl data/mm_val.jsonl \
+   --multimodal-image-root data \
    --steps 1 --eval-batches 1 --batch-size 2 \
    --seq-len 64 --skip-chat \
    --save-checkpoint-path checkpoints/vla_smoke_v2.npz
@@ -272,6 +299,7 @@ Checkpoint metadata/versioning:
 
 - Saved checkpoints include metadata key `__metadata_json__` with format version.
 - Use `--checkpoint-non-strict` to allow partial restoration when model shapes differ.
+- Use `--validate-multimodal-jsonl` to run preflight integrity checks (missing files, bad keys, shape mismatches).
 
 ---
 
