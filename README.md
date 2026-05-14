@@ -245,8 +245,33 @@ The repository now includes an early multimodal adapter path:
 
 Current status:
 - Core multimodal modules are implemented and importable.
-- The default training loop still optimizes language-model loss.
-- Full VLA action-loss training wiring is planned as a next step.
+- VLM mode now trains/evaluates with synthetic image tensors through the vision path.
+- VLA mode now trains/evaluates with joint text + action loss.
+- Synthetic multimodal smoke data is available via `--dataset-format synthetic_mm`.
+
+Quick smoke commands:
+
+```bash
+# Vision-language smoke train/eval
+python app.py \
+   --model-mode vlm \
+   --dataset-format synthetic_mm \
+   --steps 1 --eval-batches 1 --batch-size 2 \
+   --seq-len 64 --skip-chat
+
+# Vision-language-action smoke train/eval + save versioned checkpoint
+python app.py \
+   --model-mode vla \
+   --dataset-format synthetic_mm \
+   --steps 1 --eval-batches 1 --batch-size 2 \
+   --seq-len 64 --skip-chat \
+   --save-checkpoint-path checkpoints/vla_smoke_v2.npz
+```
+
+Checkpoint metadata/versioning:
+
+- Saved checkpoints include metadata key `__metadata_json__` with format version.
+- Use `--checkpoint-non-strict` to allow partial restoration when model shapes differ.
 
 ---
 

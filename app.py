@@ -16,10 +16,11 @@ Design goals:
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -29,9 +30,13 @@ from flax import nnx
 
 from nemotron import NemotronConfig, NemotronNanoBlock
 from nemotron_multimodal import NemotronMultimodal, NemotronMultimodalConfig
+from task_router import HybridBatch, compute_hybrid_loss
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
+
+
+CHECKPOINT_FORMAT_VERSION = 2
 
 # =============================================================================
 # Tokenizer
@@ -292,6 +297,31 @@ def split_train_val_texts(
     return train_texts, val_texts
 
 
+def load_synthetic_multimodal_texts(
+    max_records: int,
+) -> tuple[list[str], list[str]]:
+    """
+    Builds tiny synthetic instruction-response texts for multimodal smoke tests.
+
+    This avoids external dataset dependencies when verifying VLM/VLA plumbing.
+    """
+    if max_records < 10:
+        raise ValueError("max_records must be at least 10 for synthetic dataset")
+
+    records: list[str] = []
+    for idx in range(max_records):
+        color = ["red", "blue", "green", "yellow"][idx % 4]
+        action = ["pick", "push", "pull", "place"][idx % 4]
+        records.append(
+            f"<|user|>\nWhat should the robot do with the {color} block?\n"
+            f"<|assistant|>\nThe robot should {action} the {color} block safely."
+        )
+
+    split_index = max(1, int(0.9 * len(records)))
+    split_index = min(split_index, len(records) - 1)
+    return records[:split_index], records[split_index:]
+
+
 def load_jsonl_texts(
     jsonl_path: str,
     max_records: int,
@@ -531,6 +561,64 @@ def sample_lm_batch(
     return x, y, y_mask
 
 
+def sample_multimodal_batch(
+    token_stream: jax.Array,
+    loss_mask_stream: jax.Array,
+    batch_size: int,
+    text_seq_len: int,
+    rng_key: jax.Array,
+    image_size: int,
+    image_channels: int,
+    task_type: str,
+    action_vocab_size: int,
+) -> HybridBatch:
+    """
+    Samples text windows and synthetic image/action tensors for multimodal training.
+
+    Synthetic image tensors keep wiring simple and deterministic for integration
+    checks; real image datasets can replace this sampler later.
+    """
+    if task_type not in {"vlm", "vla"}:
+        raise ValueError("task_type must be 'vlm' or 'vla'")
+
+    x_batch, y_batch, y_mask_batch = sample_lm_batch(
+        token_stream=token_stream,
+        loss_mask_stream=loss_mask_stream,
+        batch_size=batch_size,
+        seq_len=text_seq_len,
+        rng_key=rng_key,
+    )
+
+    image_key, noise_key = jax.random.split(rng_key)
+    # Structured synthetic images (signal + noise) for smoke testing.
+    base = jax.random.uniform(
+        image_key,
+        (batch_size, image_size, image_size, image_channels),
+        minval=-1.0,
+        maxval=1.0,
+    )
+    noise = 0.05 * jax.random.normal(
+        noise_key,
+        (batch_size, image_size, image_size, image_channels),
+    )
+    pixel_values = (base + noise).astype(jnp.float32)
+
+    action_labels: jax.Array | None = None
+    if task_type == "vla":
+        # Simple deterministic target from token stream for stable smoke checks.
+        action_labels = jnp.mod(y_batch[:, -1], action_vocab_size).astype(jnp.int32)
+
+    return HybridBatch(
+        token_ids=x_batch,
+        text_labels=y_batch,
+        text_loss_mask=y_mask_batch,
+        pixel_values=pixel_values,
+        action_labels=action_labels,
+        action_positions=None,
+        task_type=task_type,
+    )
+
+
 def train_model(
     model: NemotronNanoBlock,
     optimizer: nnx.Optimizer,
@@ -611,6 +699,101 @@ def train_model(
     return rng_key
 
 
+def train_model_multimodal(
+    model: NemotronMultimodal,
+    optimizer: nnx.Optimizer,
+    train_tokens: jax.Array,
+    train_loss_mask: jax.Array,
+    steps: int,
+    batch_size: int,
+    text_seq_len: int,
+    image_size: int,
+    image_channels: int,
+    task_type: str,
+    action_vocab_size: int,
+    rng_key: jax.Array,
+) -> jax.Array:
+    """Runs multimodal training with text-only or text+action loss."""
+
+    @nnx.jit
+    def train_step(
+        model: NemotronMultimodal,
+        optimizer: nnx.Optimizer,
+        token_ids: jax.Array,
+        text_labels: jax.Array,
+        text_loss_mask: jax.Array,
+        pixel_values: jax.Array,
+        action_labels: jax.Array | None,
+    ) -> tuple[jax.Array, jax.Array]:
+        def loss_fn(model: NemotronMultimodal) -> tuple[jax.Array, jax.Array]:
+            outputs = model(
+                token_ids,
+                pixel_values=pixel_values,
+                return_dict=True,
+                return_action_logits=(task_type == "vla"),
+            )
+            text_logits = outputs["text"]
+            action_logits = outputs.get("action")
+
+            total_loss, metrics = compute_hybrid_loss(
+                text_logits=text_logits,
+                text_labels=text_labels,
+                text_loss_mask=text_loss_mask,
+                action_logits=action_logits,
+                action_labels=action_labels,
+            )
+            action_metric = metrics.get("action_loss", jnp.array(0.0))
+            return total_loss, action_metric
+
+        (total_loss, action_loss), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
+            model
+        )
+        optimizer.update(model, grads)
+        _update_all_expert_biases(model)
+        return total_loss, action_loss
+
+    print("\nTraining:")
+    for step in range(steps):
+        rng_key, batch_key = jax.random.split(rng_key)
+        batch = sample_multimodal_batch(
+            token_stream=train_tokens,
+            loss_mask_stream=train_loss_mask,
+            batch_size=batch_size,
+            text_seq_len=text_seq_len,
+            rng_key=batch_key,
+            image_size=image_size,
+            image_channels=image_channels,
+            task_type=task_type,
+            action_vocab_size=action_vocab_size,
+        )
+        total_loss, action_loss = train_step(
+            model=model,
+            optimizer=optimizer,
+            token_ids=batch.token_ids,
+            text_labels=batch.text_labels,
+            text_loss_mask=batch.text_loss_mask
+            if batch.text_loss_mask is not None
+            else jnp.ones_like(batch.text_labels, dtype=jnp.float32),
+            pixel_values=batch.pixel_values
+            if batch.pixel_values is not None
+            else jnp.zeros(
+                (batch_size, image_size, image_size, image_channels),
+                dtype=jnp.float32,
+            ),
+            action_labels=batch.action_labels,
+        )
+
+        if task_type == "vla":
+            print(
+                f"  step {step + 1:>3}/{steps} | total={float(total_loss):.4f} "
+                f"| action={float(action_loss):.4f}"
+            )
+        else:
+            print(f"  step {step + 1:>3}/{steps} | ce={float(total_loss):.4f}")
+
+    return rng_key
+
+
 def evaluate_model(
     model: NemotronNanoBlock,
     val_tokens: jax.Array,
@@ -646,6 +829,60 @@ def evaluate_model(
     ppl = jnp.exp(mean_ce)
 
     return float(mean_ce), float(ppl), rng_key
+
+
+def evaluate_model_multimodal(
+    model: NemotronMultimodal,
+    val_tokens: jax.Array,
+    val_loss_mask: jax.Array,
+    batch_size: int,
+    text_seq_len: int,
+    eval_batches: int,
+    image_size: int,
+    image_channels: int,
+    task_type: str,
+    action_vocab_size: int,
+    rng_key: jax.Array,
+) -> tuple[float, float, jax.Array]:
+    """
+    Evaluates multimodal model.
+
+    Returns mean total loss and exp(mean total loss) for parity with text mode.
+    """
+    losses: list[jax.Array] = []
+
+    for _ in range(eval_batches):
+        rng_key, batch_key = jax.random.split(rng_key)
+        batch = sample_multimodal_batch(
+            token_stream=val_tokens,
+            loss_mask_stream=val_loss_mask,
+            batch_size=batch_size,
+            text_seq_len=text_seq_len,
+            rng_key=batch_key,
+            image_size=image_size,
+            image_channels=image_channels,
+            task_type=task_type,
+            action_vocab_size=action_vocab_size,
+        )
+
+        outputs = model(
+            batch.token_ids,
+            pixel_values=batch.pixel_values,
+            return_dict=True,
+            return_action_logits=(task_type == "vla"),
+        )
+        total_loss, _ = compute_hybrid_loss(
+            text_logits=outputs["text"],
+            text_labels=batch.text_labels,
+            text_loss_mask=batch.text_loss_mask,
+            action_logits=outputs.get("action"),
+            action_labels=batch.action_labels,
+        )
+        losses.append(total_loss)
+
+    mean_loss = jnp.mean(jnp.stack(losses))
+    pseudo_ppl = jnp.exp(mean_loss)
+    return float(mean_loss), float(pseudo_ppl), rng_key
 
 
 # =============================================================================
@@ -814,6 +1051,78 @@ def chat_loop(
         print(f"Bot: {reply}")
 
 
+def _model_kind(model: NemotronNanoBlock | NemotronMultimodal) -> str:
+    if isinstance(model, NemotronMultimodal):
+        if model.config.use_action_head:
+            return "vla"
+        if model.config.use_vision:
+            return "vlm"
+    return "text"
+
+
+def _collect_checkpoint_metadata(
+    model: NemotronNanoBlock | NemotronMultimodal,
+) -> dict[str, Any]:
+    param_state = nnx.state(model, nnx.Param)
+    leaves = jax.tree_util.tree_leaves(param_state)
+    shapes = [list(jnp.asarray(leaf).shape) for leaf in leaves]
+
+    return {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "model_kind": _model_kind(model),
+        "created_at_utc": datetime.datetime.now(datetime.UTC).isoformat(),
+        "param_count": len(leaves),
+        "param_shapes": shapes,
+    }
+
+
+def save_checkpoint_from_model(
+    model: NemotronNanoBlock | NemotronMultimodal,
+    checkpoint_path: str,
+) -> int:
+    """
+    Saves model parameters in .npz format with metadata.
+
+    - Parameter leaves keep the legacy key format: param_0, param_1, ...
+    - Metadata is stored at key: __metadata_json__
+    """
+    path = Path(checkpoint_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    param_state = nnx.state(model, nnx.Param)
+    param_leaves = jax.tree_util.tree_leaves(param_state)
+
+    payload: dict[str, np.ndarray] = {}
+    for leaf_index, leaf in enumerate(param_leaves):
+        payload[f"param_{leaf_index}"] = np.asarray(leaf)
+
+    metadata = _collect_checkpoint_metadata(model)
+    payload["__metadata_json__"] = np.asarray(json.dumps(metadata), dtype=np.str_)
+
+    np.savez(path, **payload)
+    return len(param_leaves)
+
+
+def _read_checkpoint_metadata(ckpt: np.lib.npyio.NpzFile) -> dict[str, Any] | None:
+    if "__metadata_json__" not in ckpt.files:
+        return None
+
+    raw = ckpt["__metadata_json__"]
+    try:
+        if getattr(raw, "ndim", 0) == 0:
+            metadata_text = str(raw.item())
+        else:
+            metadata_text = str(raw.tolist())
+        metadata = json.loads(metadata_text)
+    except Exception as exc:
+        raise ValueError("Checkpoint metadata is present but could not be parsed") from exc
+
+    if not isinstance(metadata, dict):
+        raise ValueError("Checkpoint metadata must be a JSON object")
+
+    return metadata
+
+
 def load_checkpoint_into_model(
     model: NemotronNanoBlock | NemotronMultimodal,
     checkpoint_path: str,
@@ -822,9 +1131,9 @@ def load_checkpoint_into_model(
     """
     Loads model parameter leaves from a legacy .npz checkpoint.
 
-    Expected checkpoint format:
-    - Keys: param_0, param_1, ..., param_N
-    - Values: numpy arrays matching current model parameter shapes in order
+    Supported checkpoint formats:
+    - Legacy v1: keys param_0..param_N only
+    - v2+: param_0..param_N plus __metadata_json__ (versioned metadata)
     """
     path = Path(checkpoint_path)
     if not path.exists():
@@ -839,19 +1148,53 @@ def load_checkpoint_into_model(
         if not keys:
             raise ValueError(f"Checkpoint is empty: {checkpoint_path}")
 
-        if not all(key.startswith("param_") for key in keys):
+        metadata = _read_checkpoint_metadata(ckpt)
+        param_keys = [key for key in keys if key.startswith("param_")]
+        if not param_keys:
             raise ValueError(
-                "Checkpoint format mismatch: expected keys like 'param_0', 'param_1', ..."
+                "Checkpoint format mismatch: expected parameter keys like 'param_0', 'param_1', ..."
+            )
+
+        non_param_keys = [key for key in keys if not key.startswith("param_")]
+        if non_param_keys and non_param_keys != ["__metadata_json__"]:
+            raise ValueError(
+                "Checkpoint format mismatch: unsupported non-parameter keys "
+                f"{non_param_keys}"
             )
 
         try:
-            ordered_keys = sorted(keys, key=lambda name: int(name.split("_", 1)[1]))
+            ordered_keys = sorted(
+                param_keys,
+                key=lambda name: int(name.split("_", 1)[1]),
+            )
         except ValueError as exc:
             raise ValueError(
                 "Checkpoint keys must follow 'param_<index>' format with integer index"
             ) from exc
 
         ckpt_leaves = [jnp.asarray(ckpt[key]) for key in ordered_keys]
+
+    if metadata is not None:
+        version = metadata.get("format_version")
+        if not isinstance(version, int):
+            raise ValueError("Checkpoint metadata missing integer format_version")
+        if version > CHECKPOINT_FORMAT_VERSION:
+            raise ValueError(
+                "Checkpoint format version is newer than this loader supports: "
+                f"{version} > {CHECKPOINT_FORMAT_VERSION}"
+            )
+
+        meta_count = metadata.get("param_count")
+        if isinstance(meta_count, int) and strict and meta_count != len(param_leaves):
+            raise ValueError(
+                "Checkpoint metadata param_count mismatch: "
+                f"checkpoint={meta_count}, model={len(param_leaves)}"
+            )
+    else:
+        print(
+            "Checkpoint metadata not found (legacy format). "
+            "Consider re-saving with --save-checkpoint-path for versioned metadata."
+        )
 
     if strict and len(ckpt_leaves) != len(param_leaves):
         raise ValueError(
@@ -906,7 +1249,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--image-size",
         type=int,
-        default=224,
+        default=32,
         help="Input image size for multimodal mode",
     )
     parser.add_argument(
@@ -920,6 +1263,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=256,
         help="Intermediate vision embedding dimension before projection to d_model",
+    )
+    parser.add_argument(
+        "--vision-in-channels",
+        type=int,
+        default=3,
+        help="Input image channel count for multimodal mode",
     )
     parser.add_argument(
         "--vision-fusion",
@@ -985,8 +1334,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dataset-format",
         type=str,
         default="tinystories",
-        choices=["tinystories", "jsonl"],
+        choices=["tinystories", "jsonl", "synthetic_mm"],
         help="Dataset source format: TinyStories streaming or local JSONL files",
+    )
+    parser.add_argument(
+        "--synthetic-mm-records",
+        type=int,
+        default=200,
+        help="Number of synthetic records when --dataset-format=synthetic_mm",
     )
     parser.add_argument(
         "--train-jsonl",
@@ -1057,6 +1412,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Allow partial checkpoint loading by skipping mismatched parameter leaves",
     )
     parser.add_argument(
+        "--save-checkpoint-path",
+        type=str,
+        default=None,
+        help="Optional output path to save a versioned checkpoint after training",
+    )
+    parser.add_argument(
         "--assistant-only-loss",
         action="store_true",
         help=(
@@ -1111,6 +1472,10 @@ def main() -> None:
         raise ValueError("--checkpoint-path is required when --chat-only is set")
     if args.chat_only and args.skip_chat:
         raise ValueError("--chat-only and --skip-chat cannot be used together")
+    if args.vision_in_channels <= 0:
+        raise ValueError("--vision-in-channels must be > 0")
+    if args.model_mode == "text" and args.dataset_format == "synthetic_mm":
+        raise ValueError("--dataset-format=synthetic_mm requires --model-mode=vlm or vla")
 
     print("Initializing minimal Nemotron app...")
 
@@ -1144,6 +1509,9 @@ def main() -> None:
 
     rngs = nnx.Rngs(args.seed)
     model: NemotronNanoBlock | NemotronMultimodal
+    train_text_seq_len = args.seq_len
+    task_type: str = "text"
+    active_mm_config: NemotronMultimodalConfig | None = None
 
     if args.model_mode == "text":
         model = NemotronNanoBlock(rngs=rngs, config=base_config)
@@ -1153,24 +1521,35 @@ def main() -> None:
             use_vision=True,
             image_size=args.image_size,
             patch_size=args.patch_size,
+            vision_in_channels=args.vision_in_channels,
             vision_dim=args.vision_dim,
             vision_fusion=args.vision_fusion,
             use_action_head=(args.model_mode == "vla"),
             action_vocab_size=args.action_vocab_size,
         )
+
+        vision_tokens = (mm_config.image_size // mm_config.patch_size) ** 2
+        if vision_tokens >= args.seq_len:
+            raise ValueError(
+                "For multimodal mode, seq_len must be larger than vision token count: "
+                f"seq_len={args.seq_len}, vision_tokens={vision_tokens}"
+            )
+
+        # Keep total fused sequence length equal to seq_len so Mamba chunk
+        # constraints stay predictable.
+        train_text_seq_len = args.seq_len - vision_tokens
         model = NemotronMultimodal(rngs=rngs, config=mm_config)
+        active_mm_config = mm_config
+        task_type = args.model_mode
 
         print(
             "Multimodal adapter enabled: "
             f"vision={mm_config.use_vision}, "
             f"fusion={mm_config.vision_fusion}, "
-            f"action_head={mm_config.use_action_head}"
+            f"action_head={mm_config.use_action_head}, "
+            f"vision_tokens={vision_tokens}, "
+            f"text_seq_len={train_text_seq_len}"
         )
-        if args.model_mode == "vla":
-            print(
-                "Note: VLA action-loss training is not wired into the default "
-                "train loop yet; current run uses language-model loss only."
-            )
 
     # Chat-only mode: load checkpoint and jump straight to interactive chat.
     if args.chat_only:
@@ -1199,6 +1578,18 @@ def main() -> None:
             history_turns=args.chat_history_turns,
         )
         return
+
+    # Optional warm-start for train/eval runs.
+    if args.checkpoint_path:
+        restored_count = load_checkpoint_into_model(
+            model=model,
+            checkpoint_path=args.checkpoint_path,
+            strict=not args.checkpoint_non_strict,
+        )
+        print(
+            f"Loaded checkpoint '{args.checkpoint_path}' "
+            f"({restored_count} parameter leaves restored)."
+        )
 
     # 3) Load text data from selected dataset source.
     if args.dataset_format == "tinystories":
@@ -1229,7 +1620,7 @@ def main() -> None:
 
             print("\nTinyStories preview (first loaded sample):")
             print(f"  {preview}")
-    else:
+    elif args.dataset_format == "jsonl":
         if not args.train_jsonl or not args.val_jsonl:
             raise ValueError(
                 "--train-jsonl and --val-jsonl are required when --dataset-format=jsonl"
@@ -1262,6 +1653,16 @@ def main() -> None:
 
             print("\nJSONL preview (first loaded sample):")
             print(f"  {preview}")
+    else:
+        train_texts, val_texts = load_synthetic_multimodal_texts(
+            max_records=args.synthetic_mm_records,
+        )
+        print(
+            "Dataset setup: "
+            "source=synthetic_mm, "
+            f"train_records={len(train_texts)}, "
+            f"val_records={len(val_texts)}"
+        )
 
     # Build optimizer: AdamW with warmup + cosine decay
     max_steps = max(args.steps, 1)
@@ -1285,40 +1686,87 @@ def main() -> None:
         tokenizer=tokenizer,
         train_texts=train_texts,
         val_texts=val_texts,
-        seq_len=args.seq_len,
+        seq_len=train_text_seq_len,
         assistant_only_loss=args.assistant_only_loss,
         user_role_tag=args.user_role_tag,
         assistant_role_tag=args.assistant_role_tag,
     )
 
     # 5) Train.
-    rng_key = train_model(
-        model=model,
-        optimizer=optimizer,
-        train_tokens=train_tokens,
-        train_loss_mask=train_loss_mask,
-        steps=args.steps,
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        rng_key=rng_key,
-        debug_mask_ratio=args.debug_mask_ratio,
-        debug_mask_every=args.debug_mask_every,
-    )
+    if isinstance(model, NemotronMultimodal):
+        if active_mm_config is None:
+            raise RuntimeError("Internal error: multimodal config missing")
+
+        rng_key = train_model_multimodal(
+            model=model,
+            optimizer=optimizer,
+            train_tokens=train_tokens,
+            train_loss_mask=train_loss_mask,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            text_seq_len=train_text_seq_len,
+            image_size=active_mm_config.image_size,
+            image_channels=active_mm_config.vision_in_channels,
+            task_type=task_type,
+            action_vocab_size=active_mm_config.action_vocab_size,
+            rng_key=rng_key,
+        )
+    else:
+        rng_key = train_model(
+            model=model,
+            optimizer=optimizer,
+            train_tokens=train_tokens,
+            train_loss_mask=train_loss_mask,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            rng_key=rng_key,
+            debug_mask_ratio=args.debug_mask_ratio,
+            debug_mask_every=args.debug_mask_every,
+        )
 
     # 6) Evaluate.
-    mean_ce, perplexity, rng_key = evaluate_model(
-        model=model,
-        val_tokens=val_tokens,
-        val_loss_mask=val_loss_mask,
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        eval_batches=args.eval_batches,
-        rng_key=rng_key,
-    )
+    if isinstance(model, NemotronMultimodal):
+        if active_mm_config is None:
+            raise RuntimeError("Internal error: multimodal config missing")
+
+        mean_ce, perplexity, rng_key = evaluate_model_multimodal(
+            model=model,
+            val_tokens=val_tokens,
+            val_loss_mask=val_loss_mask,
+            batch_size=args.batch_size,
+            text_seq_len=train_text_seq_len,
+            eval_batches=args.eval_batches,
+            image_size=active_mm_config.image_size,
+            image_channels=active_mm_config.vision_in_channels,
+            task_type=task_type,
+            action_vocab_size=active_mm_config.action_vocab_size,
+            rng_key=rng_key,
+        )
+    else:
+        mean_ce, perplexity, rng_key = evaluate_model(
+            model=model,
+            val_tokens=val_tokens,
+            val_loss_mask=val_loss_mask,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            eval_batches=args.eval_batches,
+            rng_key=rng_key,
+        )
 
     print("\nEvaluation:")
     print(f"  mean CE loss: {mean_ce:.4f}")
     print(f"  perplexity:   {perplexity:.4f}")
+
+    if args.save_checkpoint_path:
+        saved_count = save_checkpoint_from_model(
+            model=model,
+            checkpoint_path=args.save_checkpoint_path,
+        )
+        print(
+            f"Saved checkpoint '{args.save_checkpoint_path}' "
+            f"({saved_count} parameter leaves, format v{CHECKPOINT_FORMAT_VERSION})."
+        )
 
     # 7) Chat.
     if not args.skip_chat:
