@@ -2,7 +2,7 @@
 Simple, minimal, and explainable Nemotron app.
 
 This script shows a full small workflow:
-1) Load a real dataset (roneneldan/TinyStories)
+1) Load a conversational JSONL dataset
 2) Train a tiny Nemotron language model
 3) Evaluate it with validation loss + perplexity
 4) Chat with it in the terminal
@@ -126,22 +126,6 @@ def encode_text(
     return ids
 
 
-def _extract_story_text(example: dict[str, object]) -> str:
-    """
-    Reads one TinyStories row and returns its text.
-
-    We check a few keys defensively so this stays easy to understand even if
-    the upstream schema changes slightly.
-    """
-    for key in ("text", "story", "content"):
-        value = example.get(key)
-        if isinstance(value, str):
-            cleaned = value.strip()
-            if cleaned:
-                return cleaned
-    return ""
-
-
 def _encode_segment(tokenizer: "PreTrainedTokenizerBase", text: str) -> list[int]:
     """Tokenizes raw text without adding any special tokens."""
     return list(tokenizer.encode(text, add_special_tokens=False))
@@ -210,85 +194,8 @@ def encode_text_with_assistant_mask(
 
 
 # =============================================================================
-# Dataset
+# Dataset (JSONL conversational text)
 # =============================================================================
-
-
-def load_tinystories_texts(
-    max_stories: int,
-    split: str = "train",
-    cache_dir: str | None = None,
-) -> list[str]:
-    """
-    Loads a bounded number of stories from roneneldan/TinyStories.
-
-    Why a bounded subset?
-    - Keeps the demo easy to run locally.
-    - Keeps the data flow simple and inspectable.
-    - Streams rows and stops early at `max_stories`.
-    """
-    if max_stories < 2:
-        raise ValueError("max_stories must be at least 2")
-
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:
-        raise ImportError(
-            "TinyStories training requires the 'datasets' package. "
-            "Install it with: pip install datasets"
-        ) from exc
-
-    try:
-        dataset = load_dataset(
-            "roneneldan/TinyStories",
-            split=split,
-            cache_dir=cache_dir,
-            streaming=True,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to load roneneldan/TinyStories. "
-            "Check your internet connection and cache permissions."
-        ) from exc
-
-    stories: list[str] = []
-
-    # Intentionally iterate in plain Python for readability.
-    for example in dataset:
-        story = _extract_story_text(example)
-        if story:
-            stories.append(story)
-        if len(stories) >= max_stories:
-            break
-
-    if len(stories) < 2:
-        raise ValueError("TinyStories did not return enough non-empty stories")
-
-    return stories
-
-
-def split_train_val_texts(
-    stories: list[str],
-    train_ratio: float,
-) -> tuple[list[str], list[str]]:
-    """
-    Splits stories into train and validation lists.
-
-    This uses a deterministic ordered split to keep behavior simple and
-    reproducible.
-    """
-    if not 0.0 < train_ratio < 1.0:
-        raise ValueError("train_ratio must be between 0 and 1")
-    if len(stories) < 2:
-        raise ValueError("Need at least 2 stories for train/validation split")
-
-    split_index = int(len(stories) * train_ratio)
-    split_index = max(1, split_index)
-    split_index = min(split_index, len(stories) - 1)
-
-    train_texts = stories[:split_index]
-    val_texts = stories[split_index:]
-    return train_texts, val_texts
 
 
 def load_jsonl_texts(
@@ -365,8 +272,8 @@ def prepare_datasets(
     """
     Creates train/val token streams from a list of text samples.
 
-    Works with both plain text (TinyStories) and role-tagged chat text (JSONL).
-    When assistant_only_loss=True, also computes a per-token loss mask that
+    Works with role-tagged chat text from JSONL records.
+    When assistant_only_loss=True, computes a per-token loss mask that
     marks only assistant content as supervised.
 
     Output format:
@@ -912,47 +819,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument(
-        "--tinystories-max-stories",
-        type=int,
-        default=5000,
-        help="How many TinyStories stories to load for this run",
-    )
-    parser.add_argument(
-        "--tinystories-train-ratio",
-        type=float,
-        default=0.9,
-        help="Fraction of stories used for training (rest for validation)",
-    )
-    parser.add_argument(
-        "--tinystories-split",
-        type=str,
-        default="train",
-        help="Hugging Face split to read from TinyStories",
-    )
-    parser.add_argument(
-        "--tinystories-cache-dir",
-        type=str,
-        default=None,
-        help="Optional Hugging Face cache directory",
-    )
-    parser.add_argument(
-        "--dataset-format",
-        type=str,
-        default="tinystories",
-        choices=["tinystories", "jsonl"],
-        help="Dataset source format: TinyStories streaming or local JSONL files",
-    )
-    parser.add_argument(
         "--train-jsonl",
         type=str,
         default=None,
-        help="Path to train JSONL file (used when --dataset-format=jsonl)",
+        help="Path to train JSONL file",
     )
     parser.add_argument(
         "--val-jsonl",
         type=str,
         default=None,
-        help="Path to validation JSONL file (used when --dataset-format=jsonl)",
+        help="Path to validation JSONL file",
     )
     parser.add_argument(
         "--jsonl-text-key",
@@ -987,7 +863,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preview-first-story",
         action="store_true",
-        help="Print a short preview of the first loaded TinyStories sample",
+        help="Print a short preview of the first loaded training sample",
     )
     parser.add_argument(
         "--skip-chat",
@@ -1010,7 +886,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Mask loss to assistant content tokens only using role tags in text "
-            "(recommended with --dataset-format=jsonl chat data)"
+            "(recommended with role-tagged chat JSONL data)"
         ),
     )
     parser.add_argument(
@@ -1062,11 +938,6 @@ def main() -> None:
         raise ValueError("--chat-only and --skip-chat cannot be used together")
 
     print("Initializing minimal Nemotron app...")
-
-    if args.assistant_only_loss and args.dataset_format != "jsonl":
-        print(
-            "Note: --assistant-only-loss is most useful with role-tagged chat JSONL data."
-        )
 
     # 1) Load Hugging Face tokenizer.
     tokenizer = load_hf_tokenizer(
@@ -1121,68 +992,37 @@ def main() -> None:
         )
         return
 
-    # 3) Load text data from selected dataset source.
-    if args.dataset_format == "tinystories":
-        all_stories = load_tinystories_texts(
-            max_stories=args.tinystories_max_stories,
-            split=args.tinystories_split,
-            cache_dir=args.tinystories_cache_dir,
-        )
-        train_texts, val_texts = split_train_val_texts(
-            stories=all_stories,
-            train_ratio=args.tinystories_train_ratio,
-        )
+    # 3) Load conversational text data from JSONL files.
+    if not args.train_jsonl or not args.val_jsonl:
+        raise ValueError("--train-jsonl and --val-jsonl are required for training/eval")
 
-        print(
-            "Dataset setup: "
-            "source=tinystories, "
-            f"total_stories={len(all_stories)}, "
-            f"train_stories={len(train_texts)}, "
-            f"val_stories={len(val_texts)}"
-        )
+    train_texts = load_jsonl_texts(
+        jsonl_path=args.train_jsonl,
+        max_records=args.jsonl_max_train_records,
+        text_key=args.jsonl_text_key,
+    )
+    val_texts = load_jsonl_texts(
+        jsonl_path=args.val_jsonl,
+        max_records=args.jsonl_max_val_records,
+        text_key=args.jsonl_text_key,
+    )
 
-        # Optional preview: helps beginners see real input text before tokenization.
-        if args.preview_first_story:
-            preview = all_stories[0].replace("\n", " ").strip()
-            preview_limit = 240
-            if len(preview) > preview_limit:
-                preview = preview[:preview_limit] + "..."
+    print(
+        "Dataset setup: "
+        "source=jsonl, "
+        f"train_records={len(train_texts)}, "
+        f"val_records={len(val_texts)}, "
+        f"text_key={args.jsonl_text_key}"
+    )
 
-            print("\nTinyStories preview (first loaded sample):")
-            print(f"  {preview}")
-    else:
-        if not args.train_jsonl or not args.val_jsonl:
-            raise ValueError(
-                "--train-jsonl and --val-jsonl are required when --dataset-format=jsonl"
-            )
+    if args.preview_first_story:
+        preview = train_texts[0].replace("\n", " ").strip()
+        preview_limit = 240
+        if len(preview) > preview_limit:
+            preview = preview[:preview_limit] + "..."
 
-        train_texts = load_jsonl_texts(
-            jsonl_path=args.train_jsonl,
-            max_records=args.jsonl_max_train_records,
-            text_key=args.jsonl_text_key,
-        )
-        val_texts = load_jsonl_texts(
-            jsonl_path=args.val_jsonl,
-            max_records=args.jsonl_max_val_records,
-            text_key=args.jsonl_text_key,
-        )
-
-        print(
-            "Dataset setup: "
-            "source=jsonl, "
-            f"train_records={len(train_texts)}, "
-            f"val_records={len(val_texts)}, "
-            f"text_key={args.jsonl_text_key}"
-        )
-
-        if args.preview_first_story:
-            preview = train_texts[0].replace("\n", " ").strip()
-            preview_limit = 240
-            if len(preview) > preview_limit:
-                preview = preview[:preview_limit] + "..."
-
-            print("\nJSONL preview (first loaded sample):")
-            print(f"  {preview}")
+        print("\nJSONL preview (first loaded sample):")
+        print(f"  {preview}")
 
     # Build optimizer: AdamW with warmup + cosine decay
     max_steps = max(args.steps, 1)
@@ -1201,7 +1041,7 @@ def main() -> None:
     # Use a separate key stream for data/generation randomness.
     rng_key = jax.random.PRNGKey(args.seed + 1)
 
-    # 4) Prepare token streams from train/validation stories.
+    # 4) Prepare token streams from train/validation text samples.
     train_tokens, val_tokens, train_loss_mask, val_loss_mask = prepare_datasets(
         tokenizer=tokenizer,
         train_texts=train_texts,

@@ -59,7 +59,7 @@ Each mixer is followed by a **Sparse Mixture-of-Experts (MoE)** layer.
 - JAX/Jax-cpu or Jax-gpu
 - Flax
 - Optax (for optimization)
-- Datasets (for TinyStories dataset)
+- Datasets (for OASST2 conversion script)
 - Transformers (for Hugging Face tokenizers)
 
 ### Setup
@@ -96,9 +96,7 @@ Google Colab:
 
 1. Open Colab and upload `notebooks/nemotron_jupyter_colab.ipynb`.
 2. Run all cells from top to bottom.
-3. In the config cell, switch `dataset_format` to:
-   - `"tinystories"` for direct Hugging Face streaming, or
-   - `"jsonl"` to train from local/Drive JSONL files.
+3. In the config cell, use JSONL train/validation file paths for conversational data.
 
 Notes:
 - The notebook uses the same training functions as `app.py` (`prepare_datasets`, `train_model`, `evaluate_model`, `generate_reply`).
@@ -110,6 +108,8 @@ Run the full pipeline (load data → train → evaluate → chat):
 
 ```bash
 python app.py \
+   --train-jsonl data/oasst2/train.jsonl \
+   --val-jsonl data/oasst2/val.jsonl \
    --steps 80 \
    --batch-size 8 \
    --seq-len 64 \
@@ -128,11 +128,10 @@ python scripts/convert_oasst2_to_jsonl.py \
    --lang en
 ```
 
-2. Train with JSONL dataset mode:
+2. Train with conversational JSONL:
 
 ```bash
 python app.py \
-   --dataset-format jsonl \
    --train-jsonl data/oasst2/train.jsonl \
    --val-jsonl data/oasst2/val.jsonl \
    --jsonl-text-key serialized_text \
@@ -142,8 +141,8 @@ python app.py \
    --skip-chat
 ```
 
-`app.py` still supports TinyStories by default. JSONL mode only changes where
-the text comes from; the training objective and model pipeline remain unchanged.
+`app.py` now trains exclusively from conversational JSONL data while preserving
+the same training objective and model pipeline.
 
 ### Phase-2: Assistant-Only Loss Masking
 
@@ -152,7 +151,6 @@ while keeping the same model architecture.
 
 ```bash
 python app.py \
-   --dataset-format jsonl \
    --train-jsonl data/oasst2/train.jsonl \
    --val-jsonl data/oasst2/val.jsonl \
    --jsonl-text-key serialized_text \
@@ -188,7 +186,7 @@ Mask ratio summary min=0.4121 max=0.7031 mean=0.5984
 
 **What happens in `app.py`:**
 
-1. **Data Loading**: Loads TinyStories dataset
+1. **Data Loading**: Loads conversational train/validation JSONL files
 2. **Tokenization**: Uses a Hugging Face tokenizer (default: `google/byt5-small`)
 3. **Model Training**: Trains the Nemotron model with validation loss tracking
 4. **Evaluation**: Computes validation perplexity
@@ -227,7 +225,7 @@ nugie-jax-nemotron/
 ├── mamba_2.py          # Mamba 2 State-Space Model blocks
 ├── moe.py              # Sparse Mixture-of-Experts implementation
 ├── checkpoints/        # Saved model weights (.npz files)
-├── data/               # Training datasets (TinyStories)
+├── data/               # Training datasets (e.g. OASST2 JSONL)
 ├── LICENSE             # Apache 2.0
 └── README.md           # This file
 ```
