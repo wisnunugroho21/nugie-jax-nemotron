@@ -11,7 +11,7 @@ What this minimal implementation keeps from the paper:
 - Sparse top-k MoE routing with shared experts
 - Squared-ReLU experts
 - RMSNorm + residual pre-norm structure
-- RoPE in attention, no dropout, and bias-free linear layers by default
+- No positional embeddings, no dropout, and bias-free linear layers
 
 What is intentionally simplified:
 - Tiny default dimensions for local experimentation
@@ -283,7 +283,6 @@ class MambaAttentionMoEBlock(nnx.Module):
             num_query_heads=config.num_attention_heads,
             num_kv_heads=config.num_kv_heads,
             head_dim=config.attention_head_dim,
-            use_bias=False,
             rngs=rngs,
         )
 

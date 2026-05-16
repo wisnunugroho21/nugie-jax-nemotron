@@ -24,13 +24,17 @@ def segsum(x: jax.Array) -> jax.Array:
     """
     Stable segment sum calculation.
 
-    Computes a lower-triangular matrix L where L[i,j] = sum(x[j:i]) for i >= j.
+    Computes a lower-triangular matrix L where:
+      L[i,j] = sum(x[j+1 : i+1])  for i >= j  (sum of x[j+1], x[j+2], ..., x[i])
+      L[i,j] = -inf                for i < j   (causal mask → exp gives 0)
+      L[i,i] = 0                                (diagonal → exp gives 1, no self-decay)
+
     This is used to build the decay matrix for the diagonal (intra-chunk) blocks
     of the structured state space model.
 
-    In the SSM context, x contains log-space decay factors (A values), so:
-      L[i,j] = sum of A[k] for k in [j, i)
-    After exponentiation, exp(L[i,j]) gives the total decay from position j to i.
+    In the SSM context, x contains log-space decay factors (A*dt values), so:
+      exp(L[i,j]) = product of A[k]*dt[k] for k in (j, i]
+    which gives the total decay from state at position j to output at position i.
 
     Args:
         x: Decay factors, shape (..., T)
@@ -181,7 +185,7 @@ class Mamba2Block(nnx.Module):
 
     def __init__(
         self,
-        rngs: nnx.Rngs,
+        rngs: nnx.Rngs,  # Random number generator for parameter initialization
         d_model: int,  # Model dimension
         d_state: int = 64,  # SSM state dimension (N in the paper)
         d_conv: int = 4,  # Causal convolution kernel width
@@ -257,6 +261,10 @@ class Mamba2Block(nnx.Module):
         """
         batch, seqlen, _ = u.shape
 
+        if seqlen % self.chunk_size != 0:
+            raise ValueError(
+                f"seqlen ({seqlen}) must be divisible by chunk_size ({self.chunk_size})"
+            )
         # --- 1. Input Projection ---
         # Project input to get all branches in one matrix multiply
         zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)

@@ -398,7 +398,7 @@ def _update_all_expert_biases(model: NemotronNanoBlock) -> None:
     not touch it — it is updated only here.
     """
     for block in model.blocks:
-        block.moe.update_expert_bias(block.moe.last_topk_indices[...])
+        block.moe.update_expert_bias(block.moe.last_topk_indices.get_value())
 
 
 def sample_lm_batch(

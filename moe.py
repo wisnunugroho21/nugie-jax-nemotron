@@ -422,7 +422,6 @@ class SparseMoE(nnx.Module):
         # selected_gates[:, :, None] broadcasts to (num_tokens, routed_top_k, d_model).
         routed_mix = jnp.sum(routed_outputs * selected_gates[:, :, None], axis=1)
         # routed_mix: (num_tokens, d_model)
-        # routed_mix: (num_tokens, d_model)
 
         # ── Shared path ─────────────────────────────────────────────────────────
 
