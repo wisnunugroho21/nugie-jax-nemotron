@@ -89,7 +89,51 @@ def load_hf_tokenizer(
     return tokenizer
 
 
-def _get_special_token_ids(
+def setup_reasoning_tokenizer(
+    tokenizer_name: str,
+    cache_dir: str | None = None,
+) -> tuple["PreTrainedTokenizerBase", int, int]:
+    """
+    Loads a tokenizer and registers <think> / </think> as special tokens.
+
+    LRM note: Large Reasoning Models use explicit thinking tokens to mark the
+    chain-of-thought section inside assistant responses. The format is:
+
+        <|assistant|>
+        <think>
+        {reasoning trace — the model works through the problem here}
+        </think>
+        {final answer}
+
+    Adding <think> and </think> as special tokens ensures they are:
+      - Always treated as single atomic units (never split by the tokenizer)
+      - Assigned stable, dedicated IDs in the vocabulary
+      - Preserved during decoding when skip_special_tokens=False
+
+    IMPORTANT: Call this BEFORE building NemotronConfig so that vocab_size
+    correctly includes the two new tokens:
+
+        tokenizer, think_open_id, think_close_id = setup_reasoning_tokenizer(name)
+        config = NemotronConfig(vocab_size=len(tokenizer), ...)
+        model = NemotronNanoBlock(rngs=rngs, config=config)
+
+    Returns:
+        tokenizer:       The loaded tokenizer with <think> and </think> added.
+        think_open_id:   Token ID for <think>.
+        think_close_id:  Token ID for </think>.
+    """
+    tokenizer = load_hf_tokenizer(tokenizer_name, cache_dir=cache_dir)
+
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": ["<think>", "</think>"]}
+    )
+
+    think_open_id = int(tokenizer.convert_tokens_to_ids("<think>"))
+    think_close_id = int(tokenizer.convert_tokens_to_ids("</think>"))
+
+    return tokenizer, think_open_id, think_close_id
+
+
     tokenizer: "PreTrainedTokenizerBase",
 ) -> tuple[int, int, int]:
     """Returns guaranteed integer IDs for PAD/BOS/EOS tokens."""
@@ -635,19 +679,108 @@ def generate_reply(
     return str(decoded), rng_key
 
 
-def build_chat_prompt(
+def generate_reply_with_thinking(
+    model: NemotronNanoBlock,
+    tokenizer: "PreTrainedTokenizerBase",
+    prompt_text: str,
+    seq_len: int,
+    max_new_tokens: int,
+    temperature: float,
+    rng_key: jax.Array,
+    show_thinking: bool = True,
+) -> tuple[str, jax.Array]:
+    """
+    Generates a reply while optionally preserving or hiding the <think> block.
+
+    LRM note: The model is trained to produce <think>...</think> traces as part
+    of the assistant response. The standard generate_reply() uses
+    skip_special_tokens=True, which silently strips <think> and </think> from
+    the output because they are registered as additional_special_tokens.
+    This function decodes with skip_special_tokens=False so the tags survive,
+    then optionally removes them for cleaner display.
+
+    Use show_thinking=True  to show the full reasoning trace (good for debugging
+    and understanding why the model reached its answer).
+    Use show_thinking=False to return only the final answer (cleaner for users).
+    """
+    import re
+
+    pad_id, bos_id, eos_id = _get_special_token_ids(tokenizer)
+
+    context_ids = encode_text(tokenizer, prompt_text, add_bos=True, add_eos=False)
+    generated_ids: list[int] = []
+
+    for _ in range(max_new_tokens):
+        model_input = pad_or_trim_context(context_ids, seq_len, pad_id)
+        logits = model(model_input)
+
+        next_logits = logits[0, -1]
+
+        # Avoid sampling control tokens during generation.
+        if pad_id != eos_id:
+            next_logits = next_logits.at[pad_id].set(-1e9)
+        if bos_id != eos_id and bos_id != pad_id:
+            next_logits = next_logits.at[bos_id].set(-1e9)
+
+        rng_key, sample_key = jax.random.split(rng_key)
+        next_id = sample_next_token(next_logits, temperature, sample_key)
+
+        if next_id == eos_id:
+            break
+
+        context_ids.append(next_id)
+        generated_ids.append(next_id)
+
+    # Decode with skip_special_tokens=False to keep <think> and </think> tags.
+    decoded = tokenizer.decode(generated_ids, skip_special_tokens=False)
+
+    # Manually remove pad/bos/eos string forms that appear when
+    # skip_special_tokens=False is used, to keep the output clean.
+    for tok_str in [tokenizer.pad_token, tokenizer.bos_token, tokenizer.eos_token]:
+        if tok_str:
+            decoded = decoded.replace(tok_str, "")
+    decoded = decoded.strip()
+
+    if not show_thinking:
+        # Strip everything between (and including) <think> and </think>.
+        # re.DOTALL makes . match newlines so multi-line traces are fully removed.
+        decoded = re.sub(
+            r"<think>.*?</think>", "", decoded, flags=re.DOTALL
+        ).strip()
+
+    return decoded, rng_key
+
+
     turns: list[tuple[str, str]],
     user_text: str,
     user_role_tag: str,
     assistant_role_tag: str,
+    system_text: str | None = None,
+    system_role_tag: str = "<|system|>",
 ) -> str:
     """
     Builds a role-tagged multi-turn prompt from chat history and latest user text.
 
-    Format:
+    LRM note: The system prompt is used to condition the model to produce thinking
+    traces. OpenThoughts-114k was collected with a specific system prompt that
+    instructs the model to reason step-by-step. Providing this (or a similar)
+    system_text at inference time helps the model enter "reasoning mode".
+
+    The recommended system_text for reasoning:
+        "Your role as an assistant involves thorough exploration of questions
+        through a systematic long thinking process before providing the final
+        precise and accurate solutions."
+
+    Format (with system):
+      <|system|>...<|user|>...<|assistant|>...<|user|>...<|assistant|>
+    Format (without system):
       <|user|>...<|assistant|>...<|user|>...<|assistant|>
     """
     parts: list[str] = []
+
+    if system_text is not None:
+        parts.append(f"{system_role_tag}\n{system_text.strip()}\n")
+
     for prev_user, prev_assistant in turns:
         parts.append(f"{user_role_tag}\n{prev_user.strip()}\n")
         parts.append(f"{assistant_role_tag}\n{prev_assistant.strip()}\n")
@@ -667,12 +800,24 @@ def chat_loop(
     user_role_tag: str,
     assistant_role_tag: str,
     history_turns: int,
+    show_thinking: bool = True,
+    system_text: str | None = None,
 ) -> None:
-    """Runs an interactive terminal chatbot with short conversation memory."""
+    """
+    Runs an interactive terminal chatbot with short conversation memory.
+
+    LRM note: show_thinking controls whether the <think>...</think> block is
+    printed to the terminal. Set show_thinking=True to inspect the model's
+    reasoning process (useful during development). Set show_thinking=False
+    to show only the final answer to the user (cleaner for demos).
+    The thinking trace is always generated internally — show_thinking only
+    affects what is printed, not what the model computes.
+    """
     if history_turns <= 0:
         raise ValueError("history_turns must be > 0")
 
-    print("\nChatbot is ready. Commands: /help, /reset, /exit")
+    thinking_label = "(thinking visible)" if show_thinking else "(thinking hidden)"
+    print(f"\nChatbot is ready {thinking_label}. Commands: /help, /reset, /exit")
     print(f"Using up to {history_turns} previous turns as prompt context.")
 
     turns: list[tuple[str, str]] = []
@@ -703,9 +848,10 @@ def chat_loop(
             user_text=user_text,
             user_role_tag=user_role_tag,
             assistant_role_tag=assistant_role_tag,
+            system_text=system_text,
         )
 
-        reply, rng_key = generate_reply(
+        reply, rng_key = generate_reply_with_thinking(
             model=model,
             tokenizer=tokenizer,
             prompt_text=prompt_text,
@@ -713,6 +859,7 @@ def chat_loop(
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             rng_key=rng_key,
+            show_thinking=show_thinking,
         )
 
         reply = reply.strip() or "..."
@@ -918,6 +1065,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=6,
         help="How many previous user-assistant turns to include in chat context",
     )
+    parser.add_argument(
+        "--show-thinking",
+        action="store_true",
+        default=False,
+        help=(
+            "Print <think>...</think> reasoning traces during chat. "
+            "LRM note: the thinking trace is always generated; this flag "
+            "only controls whether it is displayed."
+        ),
+    )
+    parser.add_argument(
+        "--system-role-tag",
+        type=str,
+        default="<|system|>",
+        help="Role tag used to mark the system prompt in the conversation format",
+    )
+    parser.add_argument(
+        "--system-text",
+        type=str,
+        default=None,
+        help=(
+            "Optional system prompt prepended to every chat context. "
+            "LRM note: Use the OpenThoughts system prompt to prime reasoning mode: "
+            "\"Your role as an assistant involves thorough exploration of questions "
+            "through a systematic long thinking process before providing the final "
+            "precise and accurate solutions.\""
+        ),
+    )
     return parser
 
 
@@ -939,8 +1114,10 @@ def main() -> None:
 
     print("Initializing minimal Nemotron app...")
 
-    # 1) Load Hugging Face tokenizer.
-    tokenizer = load_hf_tokenizer(
+    # 1) Load Hugging Face tokenizer and register <think> / </think> special tokens.
+    # LRM note: setup_reasoning_tokenizer must be called before NemotronConfig
+    # so that vocab_size = len(tokenizer) includes the 2 new tokens.
+    tokenizer, _, _ = setup_reasoning_tokenizer(
         tokenizer_name=args.tokenizer_name,
         cache_dir=args.tokenizer_cache_dir,
     )
@@ -989,6 +1166,8 @@ def main() -> None:
             user_role_tag=args.user_role_tag,
             assistant_role_tag=args.assistant_role_tag,
             history_turns=args.chat_history_turns,
+            show_thinking=args.show_thinking,
+            system_text=args.system_text,
         )
         return
 
@@ -1093,6 +1272,8 @@ def main() -> None:
             user_role_tag=args.user_role_tag,
             assistant_role_tag=args.assistant_role_tag,
             history_turns=args.chat_history_turns,
+            show_thinking=args.show_thinking,
+            system_text=args.system_text,
         )
 
 

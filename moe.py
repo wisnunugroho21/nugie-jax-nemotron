@@ -68,6 +68,17 @@ class SparseMoE(nnx.Module):
     Shared experts keep the full expert_hidden_dim (not reduced by granularity).
     In Nemotron 3 Nano: 2 shared experts.
 
+    LRM note on expert specialization: After training on diverse reasoning data
+    (math, science, code, puzzles), MoE experts tend to naturally specialize.
+    Some routed experts activate more on mathematical derivation steps, others
+    on code generation, others on natural language reasoning. The sparse top-k
+    routing learns this specialization automatically — no explicit labels or
+    constraints are needed. The shared experts, being always-on, tend to capture
+    universal reasoning patterns that appear in every domain: "let me break this
+    problem into steps", checking intermediate results, or restating the problem.
+    This specialization is one reason why MoE is particularly useful for LRM —
+    a single dense FFN must handle all reasoning types in a single weight matrix.
+
     --- Sigmoid routing (Nemotron-specific) ---
     Router logits -> sigmoid -> top-k selection.
     With softmax (most MoEs): experts compete; picking one raises another's cost.
@@ -152,7 +163,11 @@ class SparseMoE(nnx.Module):
         )
 
         # Shared experts keep the full hidden dimension.
-        # They're meant to model general token features, so they stay large.
+        # LRM note: Shared experts always run, so they handle the "common thread"
+        # across all reasoning styles: structuring a response, restating the problem,
+        # or checking arithmetic. Keeping them full-sized ensures they have enough
+        # capacity for these universal reasoning patterns without competing for
+        # routing slots.
         self.shared_expert_hidden_dim = self.expert_hidden_dim
 
         # Step size used when updating expert biases after each training step.

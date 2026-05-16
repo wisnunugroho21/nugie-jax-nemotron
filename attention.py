@@ -31,6 +31,15 @@ class GroupedQueryAttention(nnx.Module):
     - No dropout
     - No bias on linear projections
 
+    LRM note: Attention is placed in select hybrid layers (not every layer) to
+    give the model targeted retrieval capability inside long reasoning traces.
+    A reasoning model often needs to reference a result it derived several
+    paragraphs earlier (e.g., "as shown in step 3..."). The causal mask ensures
+    the model can only attend to prior tokens — it cannot peek at future steps,
+    which matches how a human writes a step-by-step solution left-to-right.
+    GQA reduces the KV cache footprint during long-trace generation, making
+    inference cheaper when reasoning traces span thousands of tokens.
+
     Args:
         d_model: Hidden/model dimension.
         num_query_heads: Number of query heads.
@@ -121,6 +130,13 @@ class GroupedQueryAttention(nnx.Module):
         scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
 
         # 6) Causal mask: position i cannot see future position j > i.
+        # LRM note: This mask is essential for reasoning models. During training
+        # the full thinking trace is present in the sequence, so position i
+        # (a later reasoning step) can freely attend to all prior steps j < i.
+        # This allows the model to build on earlier derivations and catch errors
+        # by comparing a current result against something stated earlier.
+        # Positions cannot attend to the future, preserving the autoregressive
+        # property needed for left-to-right generation at inference time.
         causal_mask = jnp.tril(jnp.ones((seqlen, seqlen), dtype=bool))
         scores = jnp.where(causal_mask[None, None, :, :], scores, -1e30)
 

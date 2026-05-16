@@ -17,6 +17,20 @@ What is intentionally simplified:
 - Tiny default dimensions for local experimentation
 - Alternating layer pattern instead of large paper-scale block scheduling
 - No distributed/expert-parallel optimization
+
+Large Reasoning Model (LRM) note:
+Converting this model into an LRM requires no architectural changes.
+The approach is Supervised Fine-Tuning (SFT) on Chain-of-Thought (CoT) data:
+  1. Use a dataset with explicit reasoning traces, e.g. open-thoughts/OpenThoughts-114k.
+  2. Add <think> and </think> as special tokens to the tokenizer.
+  3. Train with the standard next-token loss, supervising on the FULL assistant
+     turn — including the thinking trace inside <think>...</think>.
+     (Loss mask: user/system tokens = 0.0, assistant tokens = 1.0.)
+  4. At inference, the model generates <think>...</think> before the answer.
+The Mamba + Attention + MoE hybrid is well-suited for this because:
+  - Mamba handles the long reasoning traces efficiently (linear-time SSM).
+  - Attention allows cross-reference back to earlier reasoning steps.
+  - MoE experts specialize in different reasoning domains over time.
 """
 
 from dataclasses import dataclass, field
@@ -246,8 +260,18 @@ class MambaMoEBlock(nnx.Module):
         self.moe = _build_moe(config=config, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        # LRM note: Mamba processes sequences in linear time (O(n)), which is
+        # important for LRM training because reasoning traces can be thousands
+        # of tokens long. This block is used for the majority of layers in the
+        # hybrid stack, giving the model efficient long-context processing.
+
         # Mamba residual path.
         x = x + self.mamba(self.norm_mamba(x))
+
+        # LRM note: The MoE layer after every mixer lets different experts
+        # specialize. Over training, some experts activate more on mathematical
+        # derivations, others on code, others on natural language reasoning.
+        # The shared experts handle universal patterns like step-by-step breakdowns.
 
         # MoE residual path.
         return x + self.moe(self.norm_moe(x))
@@ -290,8 +314,17 @@ class MambaAttentionMoEBlock(nnx.Module):
         self.moe = _build_moe(config=config, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        # LRM note: Mamba handles the bulk of long-context sequence processing
+        # (linear time). It runs first so subsequent layers see a rich summary.
+
         # Mamba residual path.
         x = x + self.mamba(self.norm_mamba(x))
+
+        # LRM note: Attention is placed in select layers (not every layer) so
+        # the model can look back at specific earlier positions in the reasoning
+        # trace — e.g., recalling a formula defined two paragraphs ago or
+        # checking an intermediate result. This targeted retrieval ability is
+        # important for multi-step reasoning that references its own prior work.
 
         # Attention residual path.
         x = x + self.attention(self.norm_attention(x))
@@ -346,6 +379,11 @@ class NemotronNanoBlock(nnx.Module):
         )
 
     def __call__(self, token_ids: jax.Array) -> jax.Array:
+        # LRM note: During LRM training the token_ids include <think> and </think>
+        # as real tokens in the vocabulary (added via setup_reasoning_tokenizer).
+        # The model sees the full thinking trace as part of the supervised target.
+        # It learns to produce: <|assistant|> <think> {reasoning} </think> {answer}
+        # The loss is computed on ALL assistant tokens including the thinking part.
         x = self.embedding(token_ids)
 
         for block in self.blocks:
