@@ -2,7 +2,7 @@
 Simple, minimal, and explainable Nemotron app.
 
 This script shows a full small workflow:
-1) Load open-thoughts/OpenThoughts-114k directly from Hugging Face
+1) Load a pre-training dataset (directly from Hugging Face, or from local JSONL files)
 2) Train a tiny Nemotron language model
 3) Evaluate it with validation loss + perplexity
 4) Chat with it in the terminal
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
 import re
 from pathlib import Path
@@ -88,53 +89,6 @@ def load_hf_tokenizer(
             tokenizer.add_special_tokens({"pad_token": "<pad>"})
 
     return tokenizer
-
-
-def setup_reasoning_tokenizer(
-    tokenizer_name: str,
-    cache_dir: str | None = None,
-) -> tuple["PreTrainedTokenizerBase", int, int]:
-    """
-    Loads a tokenizer and registers <think> / </think> as special tokens.
-
-    LRM note: Large Reasoning Models use explicit thinking tokens to mark the
-    chain-of-thought section inside assistant responses. The format is:
-
-        <|assistant|>
-        <think>
-        {reasoning trace — the model works through the problem here}
-        </think>
-        {final answer}
-
-    Adding <think> and </think> as special tokens ensures they are:
-      - Always treated as single atomic units (never split by the tokenizer)
-      - Assigned stable, dedicated IDs in the vocabulary
-      - Preserved during decoding when skip_special_tokens=False
-
-    IMPORTANT: Call this BEFORE building NemotronConfig so that vocab_size
-    correctly includes the two new tokens:
-
-        tokenizer, think_open_id, think_close_id = setup_reasoning_tokenizer(name)
-        config = NemotronConfig(vocab_size=len(tokenizer), ...)
-        model = NemotronNanoBlock(rngs=rngs, config=config)
-
-    Returns:
-        tokenizer:       The loaded tokenizer with <think> and </think> added.
-        think_open_id:   Token ID for <think>.
-        think_close_id:  Token ID for </think>.
-    """
-    tokenizer = load_hf_tokenizer(tokenizer_name, cache_dir=cache_dir)
-
-    tokenizer.add_special_tokens(
-        {"additional_special_tokens": ["<think>", "</think>"]}
-    )
-
-    # Pass tokens as a list so convert_tokens_to_ids always returns list[int],
-    # then index [0] for a guaranteed int (avoids int | list[int] type ambiguity).
-    think_open_id: int = tokenizer.convert_tokens_to_ids("<think>")  # type: ignore[assignment]
-    think_close_id: int = tokenizer.convert_tokens_to_ids("</think>")  # type: ignore[assignment]
-
-    return tokenizer, think_open_id, think_close_id
 
 
 def _get_special_token_ids(
@@ -242,7 +196,7 @@ def encode_text_with_assistant_mask(
 
 
 # =============================================================================
-# Dataset helpers
+# Dataset helpers (shared by JSONL and Hugging Face loaders)
 # =============================================================================
 
 
@@ -252,13 +206,8 @@ def _normalize_text(text: str) -> str:
     return text
 
 
-def _serialize_turns(
-    turns: list[dict[str, str]],
-    system_text: str | None = None,
-) -> str:
+def _serialize_turns(turns: list[dict[str, str]]) -> str:
     chunks: list[str] = []
-    if system_text is not None:
-        chunks.append(f"<|system|>\n{system_text}\n")
     for turn in turns:
         chunks.append(f"<|{turn['role']}|>\n{turn['text']}\n")
     return "".join(chunks)
@@ -270,38 +219,39 @@ def _stable_hash_fraction(text: str) -> float:
 
 
 # =============================================================================
-# Dataset (OpenThoughts — Hugging Face direct load)
+# Dataset (Hugging Face direct load — FineWeb-Edu pre-training)
 # =============================================================================
 
-# The system prompt baked into every OpenThoughts-114k training example.
-# Including it during inference primes the model to enter reasoning mode.
-OPENTHOUGHTS_SYSTEM_PROMPT = (
-    "Your role as an assistant involves thorough exploration of questions through a "
-    "systematic long thinking process before providing the final precise and accurate "
-    "solutions. This requires engaging in a comprehensive cycle of analysis, "
-    "summarizing, exploration, reassessment, reflection, backtracing and iteration to "
-    "develop well-considered thinking process. Please structure your response into two "
-    "main sections: Thought and Solution. In the Thought section, detail your reasoning "
-    "process using the specified format: <think> {your thoughts} </think>. The Solution "
-    "section should follow immediately after without additional labels."
-)
 
-
-def load_hf_openthoughts_texts(
-    dataset_name: str = "open-thoughts/OpenThoughts-114k",
-    val_ratio: float = 0.05,
-    min_chars: int = 64,
-    max_chars: int = 32_000,
-    max_train_records: int = 50_000,
-    max_val_records: int = 5_000,
-    include_system_prompt: bool = True,
+def load_fineweb_edu_texts(
+    dataset_name: str = "HuggingFaceFW/fineweb-edu",
+    subset: str = "sample-10BT",
+    val_ratio: float = 0.005,
+    min_chars: int = 200,
+    max_chars: int = 10000,
+    min_score: float = 2.0,
+    max_train_records: int = 50000,
+    max_val_records: int = 1000,
 ) -> tuple[list[str], list[str]]:
     """
-    Loads open-thoughts/OpenThoughts-114k directly from Hugging Face and
-    returns train/val lists of serialized reasoning texts — no file I/O required.
+    Loads pre-training texts from HuggingFaceFW/fineweb-edu and returns
+    train/val lists of plain text documents — no file I/O required.
 
-    Each assistant turn contains a full <think>...</think> reasoning trace
-    followed by the final answer. Records without a thinking trace are skipped.
+    Each row contains a `text` field with web-crawled educational content
+    rated for quality. Records are filtered by character length and an
+    optional minimum educational quality score.
+
+    Args:
+        dataset_name: Hugging Face dataset identifier.
+        subset:       Dataset configuration/subset name (e.g. "sample-10BT",
+                      "sample-100BT", "sample-350BT", or "default").
+        val_ratio:    Fraction of records assigned to validation.
+        min_chars:    Minimum document character length to keep.
+        max_chars:    Maximum document character length to keep.
+        min_score:    Minimum educational quality score (0–5). Records below
+                      this threshold are discarded.
+        max_train_records: Cap on the number of training documents loaded.
+        max_val_records:   Cap on the number of validation documents loaded.
     """
     try:
         from datasets import load_dataset
@@ -311,70 +261,32 @@ def load_hf_openthoughts_texts(
             "Install with: pip install datasets"
         ) from exc
 
-    print(f"Loading {dataset_name} from Hugging Face...")
-    dataset = load_dataset(dataset_name, split="train")
-    print(f"  Loaded {len(dataset)} records.")
+    dataset = load_dataset(dataset_name, name=subset, split="train", streaming=True)
 
     train_texts: list[str] = []
     val_texts: list[str] = []
 
-    for record_idx, row in enumerate(dataset):
+    for idx, row in enumerate(dataset):
+        if len(train_texts) >= max_train_records and len(val_texts) >= max_val_records:
+            break
+
         if not isinstance(row, dict):
             continue
 
-        system_raw = row.get("system", None)
-        system_text: str | None = None
-        if include_system_prompt and isinstance(system_raw, str):
-            system_text = _normalize_text(system_raw)
-        elif include_system_prompt:
-            system_text = OPENTHOUGHTS_SYSTEM_PROMPT
-
-        conversations = row.get("conversations", [])
-        if not isinstance(conversations, list) or len(conversations) < 2:
+        text_raw = row.get("text")
+        if not isinstance(text_raw, str):
             continue
 
-        turns: list[dict[str, str]] = []
-        for conv in conversations:
-            if not isinstance(conv, dict):
-                continue
-
-            from_field = conv.get("from", "")
-            value_field = conv.get("value", "")
-
-            if not isinstance(from_field, str) or not isinstance(value_field, str):
-                continue
-
-            from_lower = from_field.strip().lower()
-            if from_lower in ("human", "user"):
-                role = "user"
-            elif from_lower in ("gpt", "assistant", "model"):
-                role = "assistant"
-            else:
-                continue
-
-            text = _normalize_text(value_field)
-            if not text:
-                continue
-
-            turns.append({"role": role, "text": text})
-
-        if not turns:
+        text = _normalize_text(text_raw)
+        if not (min_chars <= len(text) <= max_chars):
             continue
 
-        if turns[0]["role"] != "user" or turns[-1]["role"] != "assistant":
+        score = row.get("score")
+        if isinstance(score, (int, float)) and score < min_score:
             continue
 
-        # Skip records where the assistant turn lacks a reasoning trace.
-        if "</think>" not in turns[-1]["text"]:
-            continue
-
-        serialized_text = _serialize_turns(turns, system_text=system_text)
-        char_len = len(serialized_text)
-        if not (min_chars <= char_len <= max_chars):
-            continue
-
-        base_id = f"openthoughts_{record_idx:08d}"
-        split = "val" if _stable_hash_fraction(base_id) < val_ratio else "train"
+        sample_id = row.get("id") or f"fineweb_edu_{idx:010d}"
+        split = "val" if _stable_hash_fraction(str(sample_id)) < val_ratio else "train"
 
         if split == "train" and len(train_texts) >= max_train_records:
             continue
@@ -382,26 +294,80 @@ def load_hf_openthoughts_texts(
             continue
 
         if split == "val":
-            val_texts.append(serialized_text)
+            val_texts.append(text)
         else:
-            train_texts.append(serialized_text)
+            train_texts.append(text)
 
     if len(train_texts) < 2:
         raise ValueError(
-            f"Loaded fewer than 2 train samples from '{dataset_name}'. "
+            f"Loaded fewer than 2 train samples from '{dataset_name}' ({subset}). "
             "Try relaxing quality filters or increasing max_train_records."
         )
     if len(val_texts) < 2:
         raise ValueError(
-            f"Loaded fewer than 2 val samples from '{dataset_name}'. "
+            f"Loaded fewer than 2 val samples from '{dataset_name}' ({subset}). "
             "Try increasing val_ratio or max_val_records."
         )
 
     print(
-        f"HF dataset loaded: source={dataset_name}, "
+        f"FineWeb-Edu dataset loaded: source={dataset_name}, subset={subset}, "
         f"train={len(train_texts)}, val={len(val_texts)}"
     )
     return train_texts, val_texts
+
+
+# =============================================================================
+# Dataset (JSONL conversational text)
+# =============================================================================
+
+
+def load_jsonl_texts(
+    jsonl_path: str,
+    max_records: int,
+    text_key: str = "serialized_text",
+) -> list[str]:
+    """
+    Loads text samples from a JSONL file.
+
+    Each non-empty line must contain a JSON object with a string field at
+    `text_key` (default: serialized conversation text).
+    """
+    if max_records <= 0:
+        raise ValueError("max_records must be > 0")
+
+    path = Path(jsonl_path)
+    if not path.exists():
+        raise FileNotFoundError(f"JSONL file not found: {jsonl_path}")
+
+    texts: list[str] = []
+    with path.open("r", encoding="utf-8") as infile:
+        for line_number, line in enumerate(infile, start=1):
+            if len(texts) >= max_records:
+                break
+
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSON in {jsonl_path} at line {line_number}"
+                ) from exc
+
+            value = obj.get(text_key) if isinstance(obj, dict) else None
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if cleaned:
+                    texts.append(cleaned)
+
+    if len(texts) < 2:
+        raise ValueError(
+            f"Need at least 2 non-empty records in {jsonl_path} for training/eval"
+        )
+
+    return texts
 
 
 def _ensure_min_length(tokens: jax.Array, min_length: int) -> jax.Array:
@@ -792,109 +758,19 @@ def generate_reply(
     return str(decoded), rng_key
 
 
-def generate_reply_with_thinking(
-    model: NemotronNanoBlock,
-    tokenizer: "PreTrainedTokenizerBase",
-    prompt_text: str,
-    seq_len: int,
-    max_new_tokens: int,
-    temperature: float,
-    rng_key: jax.Array,
-    show_thinking: bool = True,
-) -> tuple[str, jax.Array]:
-    """
-    Generates a reply while optionally preserving or hiding the <think> block.
-
-    LRM note: The model is trained to produce <think>...</think> traces as part
-    of the assistant response. The standard generate_reply() uses
-    skip_special_tokens=True, which silently strips <think> and </think> from
-    the output because they are registered as additional_special_tokens.
-    This function decodes with skip_special_tokens=False so the tags survive,
-    then optionally removes them for cleaner display.
-
-    Use show_thinking=True  to show the full reasoning trace (good for debugging
-    and understanding why the model reached its answer).
-    Use show_thinking=False to return only the final answer (cleaner for users).
-    """
-    import re
-
-    pad_id, bos_id, eos_id = _get_special_token_ids(tokenizer)
-
-    context_ids = encode_text(tokenizer, prompt_text, add_bos=True, add_eos=False)
-    generated_ids: list[int] = []
-
-    for _ in range(max_new_tokens):
-        model_input = pad_or_trim_context(context_ids, seq_len, pad_id)
-        logits = model(model_input)
-
-        next_logits = logits[0, -1]
-
-        # Avoid sampling control tokens during generation.
-        if pad_id != eos_id:
-            next_logits = next_logits.at[pad_id].set(-1e9)
-        if bos_id != eos_id and bos_id != pad_id:
-            next_logits = next_logits.at[bos_id].set(-1e9)
-
-        rng_key, sample_key = jax.random.split(rng_key)
-        next_id = sample_next_token(next_logits, temperature, sample_key)
-
-        if next_id == eos_id:
-            break
-
-        context_ids.append(next_id)
-        generated_ids.append(next_id)
-
-    # Decode with skip_special_tokens=False to keep <think> and </think> tags.
-    decoded: str = tokenizer.decode(generated_ids, skip_special_tokens=False)  # type: ignore[assignment]
-
-    # Manually remove pad/bos/eos string forms that appear when
-    # skip_special_tokens=False is used, to keep the output clean.
-    for tok_str in (tokenizer.pad_token, tokenizer.bos_token, tokenizer.eos_token):
-        if isinstance(tok_str, str) and tok_str:
-            decoded = decoded.replace(tok_str, "")
-    decoded = decoded.strip()
-
-    if not show_thinking:
-        # Strip everything between (and including) <think> and </think>.
-        # re.DOTALL makes . match newlines so multi-line traces are fully removed.
-        decoded = re.sub(
-            r"<think>.*?</think>", "", decoded, flags=re.DOTALL
-        ).strip()
-
-    return decoded, rng_key
-
-
 def build_chat_prompt(
     turns: list[tuple[str, str]],
     user_text: str,
     user_role_tag: str,
     assistant_role_tag: str,
-    system_text: str | None = None,
-    system_role_tag: str = "<|system|>",
 ) -> str:
     """
     Builds a role-tagged multi-turn prompt from chat history and latest user text.
 
-    LRM note: The system prompt is used to condition the model to produce thinking
-    traces. OpenThoughts-114k was collected with a specific system prompt that
-    instructs the model to reason step-by-step. Providing this (or a similar)
-    system_text at inference time helps the model enter "reasoning mode".
-
-    The recommended system_text for reasoning:
-        "Your role as an assistant involves thorough exploration of questions
-        through a systematic long thinking process before providing the final
-        precise and accurate solutions."
-
-    Format (with system):
-      <|system|>...<|user|>...<|assistant|>...<|user|>...<|assistant|>
-    Format (without system):
+    Format:
       <|user|>...<|assistant|>...<|user|>...<|assistant|>
     """
     parts: list[str] = []
-
-    if system_text is not None:
-        parts.append(f"{system_role_tag}\n{system_text.strip()}\n")
-
     for prev_user, prev_assistant in turns:
         parts.append(f"{user_role_tag}\n{prev_user.strip()}\n")
         parts.append(f"{assistant_role_tag}\n{prev_assistant.strip()}\n")
@@ -914,24 +790,12 @@ def chat_loop(
     user_role_tag: str,
     assistant_role_tag: str,
     history_turns: int,
-    show_thinking: bool = True,
-    system_text: str | None = None,
 ) -> None:
-    """
-    Runs an interactive terminal chatbot with short conversation memory.
-
-    LRM note: show_thinking controls whether the <think>...</think> block is
-    printed to the terminal. Set show_thinking=True to inspect the model's
-    reasoning process (useful during development). Set show_thinking=False
-    to show only the final answer to the user (cleaner for demos).
-    The thinking trace is always generated internally — show_thinking only
-    affects what is printed, not what the model computes.
-    """
+    """Runs an interactive terminal chatbot with short conversation memory."""
     if history_turns <= 0:
         raise ValueError("history_turns must be > 0")
 
-    thinking_label = "(thinking visible)" if show_thinking else "(thinking hidden)"
-    print(f"\nChatbot is ready {thinking_label}. Commands: /help, /reset, /exit")
+    print("\nChatbot is ready. Commands: /help, /reset, /exit")
     print(f"Using up to {history_turns} previous turns as prompt context.")
 
     turns: list[tuple[str, str]] = []
@@ -962,10 +826,9 @@ def chat_loop(
             user_text=user_text,
             user_role_tag=user_role_tag,
             assistant_role_tag=assistant_role_tag,
-            system_text=system_text,
         )
 
-        reply, rng_key = generate_reply_with_thinking(
+        reply, rng_key = generate_reply(
             model=model,
             tokenizer=tokenizer,
             prompt_text=prompt_text,
@@ -973,7 +836,6 @@ def chat_loop(
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             rng_key=rng_key,
-            show_thinking=show_thinking,
         )
 
         reply = reply.strip() or "..."
@@ -1001,14 +863,11 @@ def load_checkpoint_into_model(
     tree_def = jax.tree_util.tree_structure(param_state)
 
     with np.load(path, allow_pickle=False) as ckpt:
-        all_keys = list(ckpt.files)
-        if not all_keys:
+        keys = list(ckpt.files)
+        if not keys:
             raise ValueError(f"Checkpoint is empty: {checkpoint_path}")
 
-        # Filter out any metadata keys (e.g. "__metadata_json__") that may be
-        # stored alongside param arrays — only param_* keys are model weights.
-        keys = [k for k in all_keys if k.startswith("param_")]
-        if not keys:
+        if not all(key.startswith("param_") for key in keys):
             raise ValueError(
                 "Checkpoint format mismatch: expected keys like 'param_0', 'param_1', ..."
             )
@@ -1083,45 +942,82 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument(
-        "--dataset",
+        "--train-jsonl",
         type=str,
-        default="open-thoughts/OpenThoughts-114k",
-        help="Hugging Face dataset name",
+        default=None,
+        help="Path to train JSONL file",
     )
     parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.05,
-        help="Fraction of samples to use for validation",
+        "--val-jsonl",
+        type=str,
+        default=None,
+        help="Path to validation JSONL file",
     )
     parser.add_argument(
-        "--min-chars",
-        type=int,
-        default=64,
-        help="Minimum serialized char length to keep",
+        "--jsonl-text-key",
+        type=str,
+        default="serialized_text",
+        help="JSON key to read text from in JSONL records",
     )
     parser.add_argument(
-        "--max-chars",
-        type=int,
-        default=32000,
-        help="Maximum serialized char length to keep",
-    )
-    parser.add_argument(
-        "--max-train-records",
+        "--jsonl-max-train-records",
         type=int,
         default=50000,
-        help="Max train records to load",
+        help="Max train records to read from train JSONL",
     )
     parser.add_argument(
-        "--max-val-records",
+        "--jsonl-max-val-records",
         type=int,
         default=5000,
-        help="Max validation records to load",
+        help="Max validation records to read from val JSONL",
     )
     parser.add_argument(
-        "--no-system-prompt",
-        action="store_true",
-        help="Omit the system prompt when loading OpenThoughts data",
+        "--hf-dataset",
+        type=str,
+        default="HuggingFaceFW/fineweb-edu",
+        help="Hugging Face dataset name to load directly (used when --train-jsonl/--val-jsonl are not provided)",
+    )
+    parser.add_argument(
+        "--hf-subset",
+        type=str,
+        default="sample-10BT",
+        help="FineWeb-Edu subset/configuration name (e.g. 'sample-10BT', 'sample-100BT', 'sample-350BT', 'default')",
+    )
+    parser.add_argument(
+        "--hf-val-ratio",
+        type=float,
+        default=0.005,
+        help="Fraction of HF dataset samples to use for validation",
+    )
+    parser.add_argument(
+        "--hf-min-chars",
+        type=int,
+        default=200,
+        help="Minimum document character length to keep (HF dataset filter)",
+    )
+    parser.add_argument(
+        "--hf-max-chars",
+        type=int,
+        default=10000,
+        help="Maximum document character length to keep (HF dataset filter)",
+    )
+    parser.add_argument(
+        "--hf-min-score",
+        type=float,
+        default=2.0,
+        help="Minimum educational quality score to keep (0–5); FineWeb-Edu filter",
+    )
+    parser.add_argument(
+        "--hf-max-train-records",
+        type=int,
+        default=50000,
+        help="Max train records to load from HF dataset",
+    )
+    parser.add_argument(
+        "--hf-max-val-records",
+        type=int,
+        default=1000,
+        help="Max validation records to load from HF dataset",
     )
     parser.add_argument(
         "--tokenizer-name",
@@ -1193,34 +1089,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=6,
         help="How many previous user-assistant turns to include in chat context",
     )
-    parser.add_argument(
-        "--show-thinking",
-        action="store_true",
-        default=False,
-        help=(
-            "Print <think>...</think> reasoning traces during chat. "
-            "LRM note: the thinking trace is always generated; this flag "
-            "only controls whether it is displayed."
-        ),
-    )
-    parser.add_argument(
-        "--system-role-tag",
-        type=str,
-        default="<|system|>",
-        help="Role tag used to mark the system prompt in the conversation format",
-    )
-    parser.add_argument(
-        "--system-text",
-        type=str,
-        default=None,
-        help=(
-            "Optional system prompt prepended to every chat context. "
-            "LRM note: Use the OpenThoughts system prompt to prime reasoning mode: "
-            "\"Your role as an assistant involves thorough exploration of questions "
-            "through a systematic long thinking process before providing the final "
-            "precise and accurate solutions.\""
-        ),
-    )
     return parser
 
 
@@ -1242,10 +1110,8 @@ def main() -> None:
 
     print("Initializing minimal Nemotron app...")
 
-    # 1) Load Hugging Face tokenizer and register <think> / </think> special tokens.
-    # LRM note: setup_reasoning_tokenizer must be called before NemotronConfig
-    # so that vocab_size = len(tokenizer) includes the 2 new tokens.
-    tokenizer, _, _ = setup_reasoning_tokenizer(
+    # 1) Load Hugging Face tokenizer.
+    tokenizer = load_hf_tokenizer(
         tokenizer_name=args.tokenizer_name,
         cache_dir=args.tokenizer_cache_dir,
     )
@@ -1294,21 +1160,41 @@ def main() -> None:
             user_role_tag=args.user_role_tag,
             assistant_role_tag=args.assistant_role_tag,
             history_turns=args.chat_history_turns,
-            show_thinking=args.show_thinking,
-            system_text=args.system_text,
         )
         return
 
-    # 3) Load OpenThoughts dataset directly from Hugging Face.
-    train_texts, val_texts = load_hf_openthoughts_texts(
-        dataset_name=args.dataset,
-        val_ratio=args.val_ratio,
-        min_chars=args.min_chars,
-        max_chars=args.max_chars,
-        max_train_records=args.max_train_records,
-        max_val_records=args.max_val_records,
-        include_system_prompt=not args.no_system_prompt,
-    )
+    # 3) Load conversational text data.
+    if args.train_jsonl and args.val_jsonl:
+        # Load from local JSONL files.
+        train_texts = load_jsonl_texts(
+            jsonl_path=args.train_jsonl,
+            max_records=args.jsonl_max_train_records,
+            text_key=args.jsonl_text_key,
+        )
+        val_texts = load_jsonl_texts(
+            jsonl_path=args.val_jsonl,
+            max_records=args.jsonl_max_val_records,
+            text_key=args.jsonl_text_key,
+        )
+        print(
+            "Dataset setup: "
+            "source=jsonl, "
+            f"train_records={len(train_texts)}, "
+            f"val_records={len(val_texts)}, "
+            f"text_key={args.jsonl_text_key}"
+        )
+    else:
+        # Load directly from Hugging Face — no local files needed.
+        train_texts, val_texts = load_fineweb_edu_texts(
+            dataset_name=args.hf_dataset,
+            subset=args.hf_subset,
+            val_ratio=args.hf_val_ratio,
+            min_chars=args.hf_min_chars,
+            max_chars=args.hf_max_chars,
+            min_score=args.hf_min_score,
+            max_train_records=args.hf_max_train_records,
+            max_val_records=args.hf_max_val_records,
+        )
 
     if args.preview_first_story:
         preview = train_texts[0].replace("\n", " ").strip()
@@ -1388,8 +1274,6 @@ def main() -> None:
             user_role_tag=args.user_role_tag,
             assistant_role_tag=args.assistant_role_tag,
             history_turns=args.chat_history_turns,
-            show_thinking=args.show_thinking,
-            system_text=args.system_text,
         )
 
 
