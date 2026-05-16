@@ -128,12 +128,15 @@ def setup_reasoning_tokenizer(
         {"additional_special_tokens": ["<think>", "</think>"]}
     )
 
-    think_open_id = int(tokenizer.convert_tokens_to_ids("<think>"))
-    think_close_id = int(tokenizer.convert_tokens_to_ids("</think>"))
+    # Pass tokens as a list so convert_tokens_to_ids always returns list[int],
+    # then index [0] for a guaranteed int (avoids int | list[int] type ambiguity).
+    think_open_id: int = tokenizer.convert_tokens_to_ids("<think>")  # type: ignore[assignment]
+    think_close_id: int = tokenizer.convert_tokens_to_ids("</think>")  # type: ignore[assignment]
 
     return tokenizer, think_open_id, think_close_id
 
 
+def _get_special_token_ids(
     tokenizer: "PreTrainedTokenizerBase",
 ) -> tuple[int, int, int]:
     """Returns guaranteed integer IDs for PAD/BOS/EOS tokens."""
@@ -732,12 +735,12 @@ def generate_reply_with_thinking(
         generated_ids.append(next_id)
 
     # Decode with skip_special_tokens=False to keep <think> and </think> tags.
-    decoded = tokenizer.decode(generated_ids, skip_special_tokens=False)
+    decoded: str = tokenizer.decode(generated_ids, skip_special_tokens=False)  # type: ignore[assignment]
 
     # Manually remove pad/bos/eos string forms that appear when
     # skip_special_tokens=False is used, to keep the output clean.
-    for tok_str in [tokenizer.pad_token, tokenizer.bos_token, tokenizer.eos_token]:
-        if tok_str:
+    for tok_str in (tokenizer.pad_token, tokenizer.bos_token, tokenizer.eos_token):
+        if isinstance(tok_str, str) and tok_str:
             decoded = decoded.replace(tok_str, "")
     decoded = decoded.strip()
 
@@ -751,6 +754,7 @@ def generate_reply_with_thinking(
     return decoded, rng_key
 
 
+def build_chat_prompt(
     turns: list[tuple[str, str]],
     user_text: str,
     user_role_tag: str,
@@ -887,11 +891,14 @@ def load_checkpoint_into_model(
     tree_def = jax.tree_util.tree_structure(param_state)
 
     with np.load(path, allow_pickle=False) as ckpt:
-        keys = list(ckpt.files)
-        if not keys:
+        all_keys = list(ckpt.files)
+        if not all_keys:
             raise ValueError(f"Checkpoint is empty: {checkpoint_path}")
 
-        if not all(key.startswith("param_") for key in keys):
+        # Filter out any metadata keys (e.g. "__metadata_json__") that may be
+        # stored alongside param arrays — only param_* keys are model weights.
+        keys = [k for k in all_keys if k.startswith("param_")]
+        if not keys:
             raise ValueError(
                 "Checkpoint format mismatch: expected keys like 'param_0', 'param_1', ..."
             )

@@ -69,6 +69,26 @@ def _normalize_text(text: str) -> str:
     return text
 
 
+def _convert_thinking_tags(text: str) -> str:
+    """Normalize OpenThoughts-114k's thinking delimiters to <think>/</ think>.
+
+    The dataset uses <|begin_of_thought|> / <|end_of_thought|> internally.
+    We convert them to our standard <think>/</ think> format so:
+      - The quality filter ("</think>" check) works correctly.
+      - The serialized_text matches what the model is trained to generate
+        (we register <think> and </think> as special tokens, not the |
+        pipe-delimited variants).
+
+    <|begin_of_solution|> / <|end_of_solution|> structural markers are stripped
+    since they are not part of the model's learned vocabulary.
+    """
+    text = text.replace("<|begin_of_thought|>", "<think>")
+    text = text.replace("<|end_of_thought|>", "</think>")
+    text = text.replace("<|begin_of_solution|>", "")
+    text = text.replace("<|end_of_solution|>", "")
+    return text
+
+
 def _stable_hash_fraction(text: str) -> float:
     """Map a string deterministically to [0, 1) for split assignment.
 
@@ -195,6 +215,8 @@ def convert_openthoughts(
                     continue
 
                 text = _normalize_text(value_field)
+                # Convert dataset-specific thinking delimiters to our standard tags.
+                text = _convert_thinking_tags(text)
                 if not text:
                     continue
 
