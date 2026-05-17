@@ -15,15 +15,15 @@ Design goals:
 
 import math
 import pathlib
-import pickle
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 from datasets import load_dataset
 from flax import nnx
-from transformers import GPT2TokenizerFast
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from moe import SparseMoE
 from nemotron import NemotronConfig, NemotronNanoBlock
@@ -32,7 +32,7 @@ from nemotron import NemotronConfig, NemotronNanoBlock
 # Hyperparameters
 # =============================================================================
 
-VOCAB_SIZE       = 50257   # GPT-2 tokenizer vocabulary
+VOCAB_SIZE       = 131072  # nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 tokenizer vocabulary
 SEQ_LEN          = 256     # input tokens per sample — must be divisible by CHUNK_SIZE
 CHUNK_SIZE       = 64      # Mamba SSD chunk size — must match NemotronConfig.mamba_chunk_size
 BATCH_SIZE       = 2
@@ -61,10 +61,8 @@ def load_raw_texts(max_samples: int, skip: int = 0) -> list[str]:
     print(f"Loading {max_samples} texts from fineweb-edu (skip={skip}) ...")
     ds = load_dataset(
         "HuggingFaceFW/fineweb-edu",
-        name="sample-10BT",
         split="train",
         streaming=True,
-        trust_remote_code=True,
     )
     texts: list[str] = []
     for i, sample in enumerate(ds):
@@ -153,8 +151,10 @@ def train_step(
     batch: jax.Array,
 ) -> jax.Array:
     """Compute gradients and update the model. Returns the scalar loss."""
-    loss, grads = nnx.value_and_grad(cross_entropy_loss)(model, batch)
-    optimizer.update(grads)
+    loss, grads = nnx.value_and_grad(
+        cross_entropy_loss, argnums=nnx.DiffState(0, nnx.Param)
+    )(model, batch)
+    optimizer.update(model, grads)
     return loss
 
 
@@ -167,41 +167,55 @@ def update_moe_biases(moe_layers: list[SparseMoE]) -> None:
     underloaded experts become easier to pick and overloaded ones harder.
     """
     for moe in moe_layers:
-        moe.update_expert_bias(moe.last_topk_indices.value)
+        moe.update_expert_bias(moe.last_topk_indices.get_value())
 
 
 # =============================================================================
-# 5. Checkpointing
+# 5. Checkpointing  (powered by Orbax)
 # =============================================================================
 
-def save_checkpoint(model: NemotronNanoBlock, step: int, ckpt_dir: str) -> None:
-    ckpt_dir = pathlib.Path(ckpt_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    path = ckpt_dir / f"step_{step:06d}.pkl"
+def make_checkpoint_manager(ckpt_dir: str, max_to_keep: int = 3) -> ocp.CheckpointManager:
+    """Create an Orbax CheckpointManager that keeps the last `max_to_keep` steps."""
+    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep)
+    return ocp.CheckpointManager(pathlib.Path(ckpt_dir), options=options)
+
+
+def save_checkpoint(
+    manager: ocp.CheckpointManager,
+    model: NemotronNanoBlock,
+    step: int,
+) -> None:
+    """Save model state at `step` via the checkpoint manager."""
     _, state = nnx.split(model)
-    with open(path, "wb") as f:
-        pickle.dump(state, f)
-    print(f"  Checkpoint saved: {path.name}")
+    manager.save(step, args=ocp.args.StandardSave(state))
+    manager.wait_until_finished()
+    print(f"  Checkpoint saved: step {step}")
 
 
-def load_latest_checkpoint(model: NemotronNanoBlock, ckpt_dir: str) -> int:
+def load_latest_checkpoint(
+    manager: ocp.CheckpointManager,
+    model: NemotronNanoBlock,
+    config: NemotronConfig,
+) -> int:
     """Restore the most recent checkpoint into model in-place.
 
     Returns the step number of the loaded checkpoint, or 0 if none found.
+    We build an abstract (shape-only) model to tell Orbax the expected array
+    shapes before it reads the files.
     """
-    ckpt_dir = pathlib.Path(ckpt_dir)
-    if not ckpt_dir.exists():
+    latest = manager.latest_step()
+    if latest is None:
         return 0
-    ckpts = sorted(ckpt_dir.glob("step_*.pkl"))
-    if not ckpts:
-        return 0
-    latest = ckpts[-1]
-    with open(latest, "rb") as f:
-        state = pickle.load(f)
-    nnx.update(model, state)
-    step = int(latest.stem.split("_")[1])
-    print(f"  Resumed from: {latest.name} (step {step})")
-    return step
+    
+    abstract_model = nnx.eval_shape(
+        lambda: NemotronNanoBlock(rngs=nnx.Rngs(0), config=config)
+    )
+    
+    _, abs_state = nnx.split(abstract_model)
+    restored = manager.restore(latest, args=ocp.args.StandardRestore(abs_state))
+    nnx.update(model, restored)
+    print(f"  Resumed from checkpoint at step {latest}")
+    return latest
 
 
 # =============================================================================
@@ -256,9 +270,11 @@ def generate(
         # Keep only the most recent MAX_CTX_LEN tokens to bound memory.
         ctx = tokens[-MAX_CTX_LEN:]
 
-        # Left-pad so length is a multiple of CHUNK_SIZE.
+        # Left-pad so length is a multiple of CHUNK_SIZE (minimum CHUNK_SIZE).
         pad_len = (-len(ctx)) % CHUNK_SIZE
         padded = [tokenizer.eos_token_id] * pad_len + ctx
+        if not padded:  # guard: empty prompt → pad to one full chunk
+            padded = [tokenizer.eos_token_id] * CHUNK_SIZE
 
         input_ids = jnp.array([padded])          # (1, padded_len)
         logits = model(input_ids)                # (1, padded_len, vocab_size)
@@ -306,9 +322,13 @@ def chat(model: NemotronNanoBlock, tokenizer) -> None:
 
 def main() -> None:
     # ── 1. Tokenizer ──────────────────────────────────────────────────────────
-    print("Loading GPT-2 tokenizer ...")
-    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
+    print("Loading Nemotron tokenizer ...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    )
+    # This tokenizer has no pad token by default; reuse eos for padding.
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # ── 2. Dataset ────────────────────────────────────────────────────────────
     # Stream 2 000 texts for training, then 200 more (skipped past train) for
@@ -323,12 +343,18 @@ def main() -> None:
 
     # ── 3. Model + optimizer ──────────────────────────────────────────────────
     print("\nBuilding model ...")
+    config     = NemotronConfig()
+    config.vocab_size = VOCAB_SIZE
+    config.mamba_chunk_size = CHUNK_SIZE
+    config.validate()
+
     model      = build_model(seed=0)
-    optimizer  = nnx.Optimizer(model, optax.adam(LEARNING_RATE))
+    optimizer  = nnx.Optimizer(model, optax.adamw(LEARNING_RATE), wrt=nnx.Param)
     moe_layers = collect_moe_layers(model)
 
-    # Resume from the latest checkpoint if one exists.
-    start_step = load_latest_checkpoint(model, CHECKPOINT_DIR)
+    # Create checkpoint manager; resume from the latest step if one exists.
+    ckpt_manager = make_checkpoint_manager(CHECKPOINT_DIR)
+    start_step   = load_latest_checkpoint(ckpt_manager, model, config)
 
     # ── 4. Training loop ──────────────────────────────────────────────────────
     print(
@@ -359,7 +385,7 @@ def main() -> None:
             print(f"  step {step:5d} / {MAX_TRAIN_STEPS}  |  loss {float(loss):.4f}")
 
         if step % CHECKPOINT_EVERY == 0:
-            save_checkpoint(model, step, CHECKPOINT_DIR)
+            save_checkpoint(ckpt_manager, model, step)
 
     # ── 5. Evaluation ─────────────────────────────────────────────────────────
     print("\nEvaluating on validation set ...")
@@ -368,7 +394,8 @@ def main() -> None:
     print(f"  Perplexity      : {val_ppl:.2f}")
 
     # ── 6. Final checkpoint ───────────────────────────────────────────────────
-    save_checkpoint(model, step, CHECKPOINT_DIR)
+    save_checkpoint(ckpt_manager, model, step)
+    ckpt_manager.close()
 
     # ── 7. Interactive chat ───────────────────────────────────────────────────
     chat(model, tokenizer)
