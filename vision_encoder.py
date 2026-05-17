@@ -21,13 +21,13 @@ Key design choices (matching the paper):
 - 2-layer MLP projector bridges encoder hidden dim to LLM d_model
 
 Simplified from real C-RADIO:
-- No teacher-student distillation
-- No register tokens
-- No RoPE positional encoding in attention
+- Multi-teacher distillation is now included (configure via VisionEncoderConfig.teachers)
+- No register tokens (real C-RADIOv4-H does not use register tokens either)
+- No RoPE positional encoding in attention (real C-RADIOv4-H does not use it either)
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +37,32 @@ from flax import nnx
 # =============================================================================
 # Config
 # =============================================================================
+
+
+@dataclass
+class TeacherConfig:
+    """
+    Describes one teacher model used in multi-teacher distillation.
+
+    C-RADIOv4 distils from three teachers simultaneously:
+      - SigLIP2-g-384  (spatial_dim=1152, summary_dim=1152)  — text-image alignment
+      - DINOv3-7B      (spatial_dim=1536, summary_dim=1536)  — dense semantic features
+      - SAM3           (spatial_dim=1280, summary_dim=0)     — segmentation features
+                                                               (no summary/CLS head)
+
+    For local experiments, set spatial_dim / summary_dim to match your student's
+    hidden_dim so the adapter heads stay small.
+
+    Args:
+        name:        Human-readable identifier, e.g. "siglip2", "dino_v3", "sam3".
+        spatial_dim: Dimensionality of the teacher's dense patch feature output.
+        summary_dim: Dimensionality of the teacher's global (CLS / summary) feature.
+                     Use 0 if the teacher has no summary token (e.g. SAM3).
+    """
+
+    name: str           # e.g. "siglip2", "dino_v3", "sam3"
+    spatial_dim: int    # teacher's dense spatial feature dimensionality
+    summary_dim: int = 0  # teacher's CLS/summary feature dim; 0 = no summary loss
 
 
 @dataclass
@@ -57,6 +83,10 @@ class VisionEncoderConfig:
     num_layers: int = 2     # Number of ViT transformer blocks
     mlp_dim: int = 256      # MLP inner width inside each transformer block
     proj_dim: int = 128     # Output dimension — must equal LLM d_model
+    teachers: list[TeacherConfig] = field(default_factory=list)
+    # ^ List of TeacherConfig entries. Leave empty ([]) for pure inference/LLM use.
+    #   Populate to enable multi-teacher distillation during training; one entry
+    #   per teacher causes one DistillationHead + a CLS token to be created.
 
 
 # =============================================================================
@@ -176,6 +206,155 @@ class ConditionalPositionalEncoding(nnx.Module):
 
         # Flatten back to sequence.
         return grid.reshape(batch, N, D)
+
+
+# =============================================================================
+# Multi-Teacher Distillation
+# =============================================================================
+
+
+def phi_s_normalize(features: jax.Array) -> jax.Array:
+    """
+    PHI-S normalization (arXiv:2410.01680 — "PHI-S: Distribution Balancing for
+    Label-Free Multi-Teacher Distillation").
+
+    Problem: different teachers produce features at very different magnitudes.
+    Without normalization the teacher with the largest activations dominates the
+    distillation loss and the student ignores the others.
+
+    Fix: standardize each token's feature vector to zero mean and unit standard
+    deviation across the channel dimension D. After normalization all teachers'
+    features live on the same scale, so their loss terms contribute equally.
+
+    Args:
+        features: (B, N, D) — dense spatial features from one teacher
+    Returns:
+        (B, N, D) — each token normalized: mean=0, std=1 across D
+    """
+    mean = jnp.mean(features, axis=-1, keepdims=True)
+    std = jnp.std(features, axis=-1, keepdims=True) + 1e-6  # avoid div-by-zero
+    return (features - mean) / std
+
+
+class DistillationHead(nnx.Module):
+    """
+    Per-teacher adapter: projects student features into one teacher's feature space.
+
+    Why a separate head per teacher?
+    SigLIP2, DINOv3, and SAM3 all have different output dimensionalities and
+    different learned "vocabularies". A single linear projection can bridge two
+    spaces — like a bilingual dictionary — so each head learns the translation
+    specific to its teacher.
+
+    Two projections (both are single linear layers, no activation):
+      spatial_proj  — (B, N, D_student) → (B, N, D_teacher_spatial)
+                      used with the spatial/dense MSE loss (after PHI-S)
+      summary_proj  — (B, D_student)    → (B, D_teacher_summary)
+                      used with the cosine summary loss
+                      created only if teacher_config.summary_dim > 0
+
+    Training pseudocode:
+        student_pred = head(student_spatial, student_summary)
+        teacher_target = run_frozen_teacher(images)          # detach gradients!
+        loss += MSE( phi_s(student_pred.spatial),
+                     phi_s(teacher_target.spatial) )
+
+    Args:
+        student_dim:    Hidden width of the student VisionEncoder (hidden_dim).
+        teacher_config: TeacherConfig specifying name and target dimensions.
+    """
+
+    def __init__(self, student_dim: int, teacher_config: TeacherConfig, rngs: nnx.Rngs):
+        self.name = teacher_config.name
+        # Dense feature adapter: maps patch tokens to teacher's spatial feature space.
+        self.spatial_proj = nnx.Linear(
+            student_dim, teacher_config.spatial_dim, use_bias=False, rngs=rngs
+        )
+        # Global feature adapter: maps CLS token to teacher's summary space (optional).
+        self.has_summary = teacher_config.summary_dim > 0
+        if self.has_summary:
+            self.summary_proj = nnx.Linear(
+                student_dim, teacher_config.summary_dim, use_bias=False, rngs=rngs
+            )
+
+    def __call__(
+        self,
+        spatial_tokens: jax.Array,
+        summary_token: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array | None]:
+        """
+        Args:
+            spatial_tokens: (B, N, student_dim) — patch features from the student
+            summary_token:  (B, student_dim)    — CLS token output; required when
+                                                  has_summary=True
+        Returns:
+            spatial_pred:  (B, N, teacher_spatial_dim)
+            summary_pred:  (B, teacher_summary_dim) or None
+        """
+        spatial_pred = self.spatial_proj(spatial_tokens)
+        summary_pred = (
+            self.summary_proj(summary_token)
+            if (self.has_summary and summary_token is not None)
+            else None
+        )
+        return spatial_pred, summary_pred
+
+
+def compute_distillation_loss(
+    teacher_preds: dict,
+    teacher_targets: dict,
+) -> dict:
+    """
+    Compute per-teacher distillation losses.
+
+    Two loss components per teacher:
+
+    1. Spatial loss — MSE in PHI-S normalized space:
+           L_spatial = mean( (phi_s(student_pred) - phi_s(teacher_target))^2 )
+       PHI-S ensures high-magnitude teachers (SAM3) don't swamp low-magnitude
+       ones (SigLIP2).  Applied to dense per-patch feature maps.
+
+    2. Summary loss — cosine distance:
+           L_summary = mean( 1 - cos_similarity(student_pred, teacher_target) )
+       Scale-invariant; used for teachers that produce a global (CLS) summary
+       token such as SigLIP2 (text alignment) and DINOv3 (kNN classification).
+       Value is 0 when perfectly aligned, 2 when completely opposite.
+
+    Total training loss = sum over all teachers of (L_spatial + L_summary).
+
+    Args:
+        teacher_preds:   {name: {"spatial": (B,N,D_t), "summary": (B,D_s)|None}}
+                         Student adapter predictions from DistillationHead.
+        teacher_targets: {name: {"spatial": (B,N,D_t), "summary": (B,D_s)|None}}
+                         Frozen teacher model outputs (must be detached from grad).
+    Returns:
+        {teacher_name: scalar JAX array} — one combined loss value per teacher
+    """
+    losses = {}
+    for name, pred in teacher_preds.items():
+        target = teacher_targets[name]
+        loss = jnp.array(0.0)
+
+        # --- Spatial distillation: MSE in PHI-S normalized space ---
+        if pred["spatial"] is not None and target["spatial"] is not None:
+            p_sp = phi_s_normalize(pred["spatial"])    # (B, N, D_t)
+            t_sp = phi_s_normalize(target["spatial"])  # (B, N, D_t)
+            loss = loss + jnp.mean((p_sp - t_sp) ** 2)
+
+        # --- Summary distillation: cosine distance ---
+        if pred["summary"] is not None and target["summary"] is not None:
+            # L2-normalize to unit sphere, then cos_sim = dot product.
+            p_su = pred["summary"] / (
+                jnp.linalg.norm(pred["summary"], axis=-1, keepdims=True) + 1e-8
+            )
+            t_su = target["summary"] / (
+                jnp.linalg.norm(target["summary"], axis=-1, keepdims=True) + 1e-8
+            )
+            cos_sim = jnp.sum(p_su * t_su, axis=-1)  # (B,)
+            loss = loss + jnp.mean(1.0 - cos_sim)     # cosine distance, averaged
+
+        losses[name] = loss
+    return losses
 
 
 # =============================================================================
@@ -366,6 +545,21 @@ class VisionEncoder(nnx.Module):
         self.pixel_shuffle = PixelShuffle(config.hidden_dim, rngs=rngs)
         self.norm = nnx.RMSNorm(config.hidden_dim, rngs=rngs)
 
+        # --- Optional multi-teacher distillation components ---
+        # These are only created when config.teachers is non-empty, so inference
+        # and LLM integration (via __call__) are completely unaffected.
+        if config.teachers:
+            # Learnable CLS token: shape (1, 1, D), broadcast over batch in distill().
+            # It is prepended to the patch sequence so every transformer layer can
+            # read from it (and write to it via attention), producing a global image
+            # summary analogous to the CLS token in BERT / ViT.
+            self.cls_token = nnx.Param(jnp.zeros((1, 1, config.hidden_dim)))
+            # One adapter head per teacher: linear projection into teacher's space.
+            self.distillation_heads = nnx.List([
+                DistillationHead(config.hidden_dim, t, rngs=rngs)
+                for t in config.teachers
+            ])
+
     def __call__(self, images: jax.Array) -> jax.Array:
         """
         Args:
@@ -392,6 +586,72 @@ class VisionEncoder(nnx.Module):
         tokens = self.pixel_shuffle(tokens, h, w)  # (B, N_out, D)
 
         return tokens
+
+    def distill(
+        self, images: jax.Array
+    ) -> tuple[dict, jax.Array, jax.Array]:
+        """
+        Forward pass for multi-teacher distillation training.
+
+        This method is used ONLY during training — never for LLM inference.
+        It runs the full encoder with a prepended CLS token, then applies
+        each teacher's DistillationHead to produce predictions that are matched
+        against frozen teacher outputs using compute_distillation_loss().
+
+        Why a separate method (not inside __call__)?
+        The LLM integration only needs pixel-shuffled patch tokens. Mixing the
+        CLS token and distillation heads into __call__ would add dead weight at
+        inference time and make both paths harder to read.
+
+        Pipeline:
+          1. PatchEmbedding + CPE  (same as __call__)
+          2. Prepend CLS token → full_seq: (B, 1+N, D)
+          3. All transformer blocks process full_seq (CLS ↔ patches via attention)
+          4. RMSNorm on all positions
+          5. Split: full_seq[:,0] = summary (global), full_seq[:,1:] = spatial (dense)
+          6. Apply each DistillationHead → per-teacher student predictions
+
+        Args:
+            images: (B, H, W, C) float image
+        Returns:
+            teacher_preds:  {name: {"spatial": (B,N,D_t), "summary": (B,D_s)|None}}
+                            Student adapter predictions; pass to compute_distillation_loss().
+            spatial_tokens: (B, N, D) — raw patch features (before pixel shuffle)
+            summary_token:  (B, D)    — CLS token output = global image summary
+        """
+        assert hasattr(self, "cls_token"), (
+            "distill() requires config.teachers to be non-empty when building the encoder"
+        )
+        batch = images.shape[0]
+
+        # Steps 1: patch embed + CPE (identical to __call__).
+        tokens, h, w = self.patch_embed(images)  # (B, N, D)
+        tokens = self.cpe(tokens, h, w)           # (B, N, D)
+
+        # Step 2: prepend the learnable CLS token.
+        # Broadcast (1, 1, D) → (B, 1, D), then concatenate at position 0.
+        # Every subsequent attention layer can read from and write to this token.
+        cls = jnp.broadcast_to(self.cls_token.value, (batch, 1, tokens.shape[-1]))
+        full_seq = jnp.concatenate([cls, tokens], axis=1)  # (B, 1+N, D)
+
+        # Step 3: transformer blocks — CLS and patch tokens attend to each other.
+        for block in self.blocks:
+            full_seq = block(full_seq)
+
+        # Step 4: normalize all positions.
+        full_seq = self.norm(full_seq)
+
+        # Step 5: split into summary (CLS output) and spatial (patch outputs).
+        summary_token = full_seq[:, 0, :]   # (B, D) — global image summary
+        spatial_tokens = full_seq[:, 1:, :] # (B, N, D) — dense per-patch features
+
+        # Step 6: project through each teacher's adapter head.
+        teacher_preds = {}
+        for head in self.distillation_heads:
+            sp, su = head(spatial_tokens, summary_token)
+            teacher_preds[head.name] = {"spatial": sp, "summary": su}
+
+        return teacher_preds, spatial_tokens, summary_token
 
 
 # =============================================================================
