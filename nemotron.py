@@ -134,26 +134,23 @@ class NemotronConfig:
                     ("mamba_attention_moe", 1),
                     ("mamba_moe",         2),
                 ],
-                # Paper-style GQA shape choices.
-                num_attention_heads=32,
-                num_kv_heads=2,
-                attention_head_dim=64,
-                # Paper-style Mamba settings.
-                mamba_d_state=128,
-                mamba_d_conv=4,
-                mamba_expand=2,
-                mamba_headdim=64,
-                mamba_ngroups=8,
-                mamba_chunk_size=64,
-                # Paper-style MoE settings.
-                num_experts=64,
-                num_shared_experts=2,
-                top_k=6,
-                expert_hidden_dim=1856,
-                granularity_factor=2,
-                # Keep exactly 6 activated routed experts (paper behavior).
-                scale_top_k_with_granularity=False,
-                rms_norm_eps=1e-6,
+                d_model              = 256,
+                # Attention: 4 heads × 64 = 256 = d_model ✓
+                num_attention_heads  = 4,
+                attention_head_dim   = 64,
+                num_kv_heads         = 2,
+                # Mamba: d_inner = 2 × 256 = 512, nheads = 8, ngroups = 2 — all divisible ✓
+                mamba_d_state        = 128,
+                mamba_expand         = 2,
+                mamba_headdim        = 64,
+                mamba_ngroups        = 2,
+                mamba_chunk_size     = 64,
+                # MoE: more experts, wider hidden dim
+                num_experts          = 8,
+                num_shared_experts   = 1,
+                top_k                = 2,
+                expert_hidden_dim    = 512,
+                granularity_factor   = 1,
             )
 
         if key in ("paper_close", "paper-close", "paper"):
