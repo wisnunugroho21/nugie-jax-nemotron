@@ -38,7 +38,8 @@ CHUNK_SIZE       = 64      # Mamba SSD chunk size — must match NemotronConfig.
 BATCH_SIZE       = 2
 LEARNING_RATE    = 3e-4
 CHECKPOINT_EVERY = 200     # save a checkpoint every N training steps
-MAX_TRAIN_STEPS  = 1000
+MAX_TRAIN_STEPS  = 10000
+WARMUP_STEPS     = 1000    # linear warmup for the first N steps
 VAL_STEPS        = 50      # how many batches to average for validation
 CHECKPOINT_DIR   = "./checkpoints"
 MAX_GEN_TOKENS   = 200     # max new tokens per chat response
@@ -139,9 +140,57 @@ def cross_entropy_loss(model: NemotronNanoBlock, batch: jax.Array) -> jax.Array:
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
     return loss.mean()
 
+# =============================================================================
+# 4. Learning Rate Schedule
+# =============================================================================
+
+def create_lr_schedule(
+    max_steps: int, warmup_steps: int, peak_lr: float
+) -> optax.Schedule:
+    """
+    Creates a two-phase learning rate schedule:
+      Phase 1 (steps 0 .. warmup_steps):        linear ramp  0 → peak_lr
+      Phase 2 (steps warmup_steps .. max_steps): cosine decay peak_lr → 0
+
+    This avoids early training instability (warmup) while allowing the
+    optimizer to fine-tune at smaller learning rates later (cosine decay).
+    """
+    warmup = optax.linear_schedule(
+        init_value=0.0,
+        end_value=peak_lr,
+        transition_steps=warmup_steps,
+    )
+    decay = optax.cosine_decay_schedule(
+        init_value=peak_lr,
+        decay_steps=max(max_steps - warmup_steps, 1),
+    )
+    return optax.join_schedules(
+        schedules=[warmup, decay],
+        boundaries=[warmup_steps],
+    )
+
+def make_gradient_transform_optimizer(max_steps: int, warmup_steps: int, peak_lr: float = 3e-4, weight_decay: float = 0.1) -> optax.GradientTransformation:
+    """
+    Creates an Optax gradient transformation for optimizer with the custom learning rate schedule.
+    We use AdamW with weight decay, which is common for transformer training.
+    """
+    max_steps = max(max_steps, 1)
+    warmup_steps = max(1, max_steps // 10)
+    
+    lr_schedule = create_lr_schedule(
+        max_steps=max_steps,
+        warmup_steps=warmup_steps,
+        peak_lr=peak_lr,
+    )
+
+    return optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=lr_schedule, weight_decay=weight_decay),
+    )
+
 
 # =============================================================================
-# 4. Training step
+# 5. Training step
 # =============================================================================
 
 @nnx.jit
@@ -171,7 +220,7 @@ def update_moe_biases(moe_layers: list[SparseMoE]) -> None:
 
 
 # =============================================================================
-# 5. Checkpointing  (powered by Orbax)
+# 6. Checkpointing  (powered by Orbax)
 # =============================================================================
 
 def make_checkpoint_manager(ckpt_dir: str, max_to_keep: int = 3) -> ocp.CheckpointManager:
@@ -219,7 +268,7 @@ def load_latest_checkpoint(
 
 
 # =============================================================================
-# 6. Evaluation
+# 7. Evaluation
 # =============================================================================
 
 def evaluate(
@@ -242,7 +291,7 @@ def evaluate(
 
 
 # =============================================================================
-# 7. Generation
+# 8. Generation
 # =============================================================================
 
 def generate(
@@ -294,7 +343,7 @@ def generate(
 
 
 # =============================================================================
-# 8. Chat loop
+# 9. Chat loop
 # =============================================================================
 
 def chat(model: NemotronNanoBlock, tokenizer) -> None:
@@ -349,7 +398,7 @@ def main() -> None:
     config.validate()
 
     model      = build_model(seed=0)
-    optimizer  = nnx.Optimizer(model, optax.adamw(LEARNING_RATE), wrt=nnx.Param)
+    optimizer  = nnx.Optimizer(model, make_gradient_transform_optimizer(MAX_TRAIN_STEPS, WARMUP_STEPS, LEARNING_RATE), wrt=nnx.Param)
     moe_layers = collect_moe_layers(model)
 
     # Create checkpoint manager; resume from the latest step if one exists.
