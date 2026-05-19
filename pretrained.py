@@ -25,8 +25,9 @@ from datasets import load_dataset
 from flax import nnx
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-from moe import SparseMoE
-from nemotron import NemotronConfig, NemotronNanoBlock
+from latent_moe import LatentMoE
+from multi_token_prediction import mtp_loss
+from nemotron import NemotronSuperConfig, NemotronSuperBlock
 
 # =============================================================================
 # Hyperparameters
@@ -34,7 +35,7 @@ from nemotron import NemotronConfig, NemotronNanoBlock
 
 VOCAB_SIZE       = 131072  # nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 tokenizer vocabulary
 SEQ_LEN          = 256     # input tokens per sample — must be divisible by CHUNK_SIZE
-CHUNK_SIZE       = 64      # Mamba SSD chunk size — must match NemotronConfig.mamba_chunk_size
+CHUNK_SIZE       = 64      # Mamba SSD chunk size — must match NemotronSuperConfig.mamba_chunk_size
 BATCH_SIZE       = 2
 LEARNING_RATE    = 3e-4
 CHECKPOINT_EVERY = 200     # save a checkpoint every N training steps
@@ -47,6 +48,7 @@ MAX_CTX_LEN      = 512     # rolling context window during generation — must b
 
 assert SEQ_LEN % CHUNK_SIZE == 0,     "SEQ_LEN must be divisible by CHUNK_SIZE"
 assert MAX_CTX_LEN % CHUNK_SIZE == 0, "MAX_CTX_LEN must be divisible by CHUNK_SIZE"
+NUM_MTP_HEADS    = 2       # extra prediction depths — must match NemotronSuperConfig.num_mtp_heads
 
 # =============================================================================
 # 1. Dataset helpers
@@ -78,15 +80,18 @@ def load_raw_texts(max_samples: int, skip: int = 0) -> list[str]:
 
 def tokenize_and_pack(texts: list[str], tokenizer, seq_len: int) -> np.ndarray:
     """Tokenize all texts, concatenate into one token stream, then cut into
-    non-overlapping chunks of (seq_len + 1) tokens.
+    non-overlapping chunks of (seq_len + NUM_MTP_HEADS + 1) tokens.
 
-    Each chunk has seq_len+1 tokens so the training code can slice:
-      inputs = chunk[:, :-1]   — seq_len tokens fed into the model
-      labels = chunk[:, 1:]    — seq_len next-tokens used as targets
+    Each chunk carries NUM_MTP_HEADS extra future tokens beyond the standard
+    next-token label so NemotronSuperBlock.forward_train can extract
+    teacher-forcing tokens and MTP labels for all prediction depths:
+      main model inputs = chunk[:, :seq_len]
+      main labels       = chunk[:, 1:seq_len+1]
+      MTP labels        = chunk[:, 2:seq_len+NUM_MTP_HEADS+1]
 
-    Returns an array of shape (n_chunks, seq_len + 1).
+    Returns an array of shape (n_chunks, seq_len + NUM_MTP_HEADS + 1).
     """
-    chunk_len = seq_len + 1
+    chunk_len = seq_len + NUM_MTP_HEADS + 1
     all_tokens: list[int] = []
     for text in texts:
         all_tokens.extend(tokenizer.encode(text))
@@ -109,36 +114,37 @@ def make_batches(chunks: np.ndarray, batch_size: int):
 # 2. Model
 # =============================================================================
 
-def build_model(seed: int = 0) -> NemotronNanoBlock:
-    """Build a tiny Nemotron configured for the GPT-2 vocabulary."""
-    config = NemotronConfig.from_preset("tiny")          # tiny defaults (d_model=128, etc.)
+def build_model(seed: int = 0) -> NemotronSuperBlock:
+    """Build a tiny Nemotron 3 Super configured for the Nemotron tokenizer vocabulary."""
+    config = NemotronSuperConfig.from_preset("tiny_super")
     config.vocab_size = VOCAB_SIZE
     config.mamba_chunk_size = CHUNK_SIZE
     config.validate()
-    return NemotronNanoBlock(rngs=nnx.Rngs(seed), config=config)
+    return NemotronSuperBlock(rngs=nnx.Rngs(seed), config=config)
 
 
-def collect_moe_layers(model: NemotronNanoBlock) -> list[SparseMoE]:
-    """Collect every SparseMoE sub-module in the model."""
-    return [block.moe for block in model.blocks]
+def collect_moe_layers(model: NemotronSuperBlock) -> list[LatentMoE]:
+    """Collect every LatentMoE sub-module in the model."""
+    return model.collect_moe_layers()
 
 
 # =============================================================================
 # 3. Loss
 # =============================================================================
 
-def cross_entropy_loss(model: NemotronNanoBlock, batch: jax.Array) -> jax.Array:
-    """Standard next-token prediction loss.
+def cross_entropy_loss(model: NemotronSuperBlock, batch: jax.Array) -> jax.Array:
+    """Combined next-token and MTP auxiliary training loss.
 
-    batch: (B, seq_len + 1)
-      inputs = batch[:, :-1]  →  fed into the model
-      labels = batch[:, 1:]   →  the shifted-by-one targets
+    batch: (B, seq_len + NUM_MTP_HEADS + 1)
+      NemotronSuperBlock.forward_train handles all slicing internally.
+      The returned loss is main_loss + mtp_loss_scale * mean(mtp_losses).
     """
-    inputs = batch[:, :-1]          # (B, seq_len)
-    labels = batch[:, 1:]           # (B, seq_len)
-    logits = model(inputs)          # (B, seq_len, vocab_size)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
-    return loss.mean()
+    main_logits, main_labels, mtp_outputs = model.forward_train(batch)
+    main_loss = optax.softmax_cross_entropy_with_integer_labels(
+        main_logits, main_labels
+    ).mean()
+    aux_loss = mtp_loss(mtp_outputs, scale=model.config.mtp_loss_scale)
+    return main_loss + aux_loss
 
 # =============================================================================
 # 4. Learning Rate Schedule
@@ -195,7 +201,7 @@ def make_gradient_transform_optimizer(max_steps: int, warmup_steps: int, peak_lr
 
 @nnx.jit
 def train_step(
-    model: NemotronNanoBlock,
+    model: NemotronSuperBlock,
     optimizer: nnx.Optimizer,
     batch: jax.Array,
 ) -> jax.Array:
@@ -207,11 +213,11 @@ def train_step(
     return loss
 
 
-def update_moe_biases(moe_layers: list[SparseMoE]) -> None:
-    """Update expert load-balancing biases for every MoE layer.
+def update_moe_biases(moe_layers: list[LatentMoE]) -> None:
+    """Update expert load-balancing biases for every LatentMoE layer.
 
     Must be called AFTER the optimizer step and outside the gradient tape.
-    Each SparseMoE stashes the top-k routing indices from its most recent
+    Each LatentMoE stashes the top-k routing indices from its most recent
     forward pass in `self.last_topk_indices`; we use those to nudge biases so
     underloaded experts become easier to pick and overloaded ones harder.
     """
@@ -231,7 +237,7 @@ def make_checkpoint_manager(ckpt_dir: str, max_to_keep: int = 3) -> ocp.Checkpoi
 
 def save_checkpoint(
     manager: ocp.CheckpointManager,
-    model: NemotronNanoBlock,
+    model: NemotronSuperBlock,
     step: int,
 ) -> None:
     """Save model state at `step` via the checkpoint manager."""
@@ -243,8 +249,8 @@ def save_checkpoint(
 
 def load_latest_checkpoint(
     manager: ocp.CheckpointManager,
-    model: NemotronNanoBlock,
-    config: NemotronConfig,
+    model: NemotronSuperBlock,
+    config: NemotronSuperConfig,
 ) -> int:
     """Restore the most recent checkpoint into model in-place.
 
@@ -255,9 +261,9 @@ def load_latest_checkpoint(
     latest = manager.latest_step()
     if latest is None:
         return 0
-    
+
     abstract_model = nnx.eval_shape(
-        lambda: NemotronNanoBlock(rngs=nnx.Rngs(0), config=config)
+        lambda: NemotronSuperBlock(rngs=nnx.Rngs(0), config=config)
     )
     
     _, abs_state = nnx.split(abstract_model)
@@ -272,17 +278,25 @@ def load_latest_checkpoint(
 # =============================================================================
 
 def evaluate(
-    model: NemotronNanoBlock,
+    model: NemotronSuperBlock,
     val_chunks: np.ndarray,
     val_steps: int,
 ) -> tuple[float, float]:
-    """Return (mean_loss, perplexity) averaged over val_steps batches."""
+    """Return (mean_loss, perplexity) averaged over val_steps batches.
+
+    Uses the main next-token prediction loss only — not the MTP auxiliary loss —
+    so that perplexity reflects standard language modeling quality.
+    """
     total_loss = 0.0
     count = 0
     for batch_np in make_batches(val_chunks, BATCH_SIZE):
         if count >= val_steps:
             break
-        loss = cross_entropy_loss(model, jnp.array(batch_np))
+        # Discard MTP outputs; eval uses main next-token loss only.
+        main_logits, main_labels, _ = model.forward_train(jnp.array(batch_np))
+        loss = optax.softmax_cross_entropy_with_integer_labels(
+            main_logits, main_labels
+        ).mean()
         total_loss += float(loss)
         count += 1
     mean_loss = total_loss / max(count, 1)
@@ -295,7 +309,7 @@ def evaluate(
 # =============================================================================
 
 def generate(
-    model: NemotronNanoBlock,
+    model: NemotronSuperBlock,
     tokenizer,
     prompt: str,
     max_new_tokens: int = MAX_GEN_TOKENS,
@@ -346,7 +360,7 @@ def generate(
 # 9. Chat loop
 # =============================================================================
 
-def chat(model: NemotronNanoBlock, tokenizer) -> None:
+def chat(model: NemotronSuperBlock, tokenizer) -> None:
     print("\n--- Chat mode  (type 'quit' to exit) ---\n")
     seed = 0
     while True:
@@ -392,7 +406,7 @@ def main() -> None:
 
     # ── 3. Model + optimizer ──────────────────────────────────────────────────
     print("\nBuilding model ...")
-    config     = NemotronConfig().from_preset("tiny")          # tiny defaults (d_model=128, etc.)
+    config     = NemotronSuperConfig.from_preset("tiny_super")
     config.vocab_size = VOCAB_SIZE
     config.mamba_chunk_size = CHUNK_SIZE
     config.validate()
