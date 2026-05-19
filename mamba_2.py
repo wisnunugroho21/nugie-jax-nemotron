@@ -9,6 +9,16 @@ Reference code: https://github.com/state-spaces/mamba
   - mamba_ssm/modules/mamba2_simple.py (Full Mamba-2 block)
 
 This implementation prioritizes simplicity and readability over performance.
+
+LRM note: SSMs like Mamba-2 are especially valuable in Large Reasoning Models
+because reasoning traces are long — typically 2,000–8,000 tokens. Standard
+attention costs O(n²) in both compute and memory, which becomes expensive at
+those lengths. Mamba-2 processes sequences in O(n) time via the SSM recurrence,
+making it feasible to train on and generate long reasoning chains.
+
+The chunked SSD algorithm (ssd_minimal_discrete) means the long trace is never
+held entirely in memory at once — it is processed in blocks, further reducing
+the memory footprint during training.
 """
 
 import jax
@@ -78,6 +88,15 @@ def ssd_minimal_discrete(
       2. Intra-chunk states   (right factor     — B terms)
       3. Inter-chunk states   (middle factor    — A terms, chunk-level recurrence)
       4. State-to-output      (left factor      — C terms)
+
+    LRM note: The chunked structure is important for reasoning models. A single
+    reasoning trace may span many thousands of tokens, and processing it as one
+    flat sequence would require O(n) memory for the SSM state. By splitting into
+    chunks of `block_len` tokens and using a compact inter-chunk recurrence to
+    pass state across boundaries, this algorithm keeps memory usage bounded.
+    The chunk boundary is where Mamba "summarizes" what it has read so far into
+    a fixed-size state vector — analogous to how a person pauses and recalls the
+    key facts before continuing to the next step of a derivation.
 
     The key insight: the SSM output matrix has a semi-separable structure that can
     be decomposed into diagonal blocks (handled by step 1) and off-diagonal blocks
@@ -181,6 +200,13 @@ class Mamba2Block(nnx.Module):
 
     This mirrors the official Mamba2Simple module but uses Flax NNX instead
     of PyTorch, and calls ssd_minimal_discrete instead of CUDA/Triton kernels.
+
+    LRM note: This block is the workhorse of the hybrid model. Most layers in
+    the Nemotron stack are Mamba-only MoE blocks (see nemotron.py patterns).
+    Because Mamba runs in O(n) time, the model can process 4,000-token reasoning
+    traces at roughly the same cost as a 256-token chat reply. The input-to-output
+    skip connection (D * x) ensures that shallow information (e.g., the original
+    question tokens) remains accessible even deep into the reasoning trace.
     """
 
     def __init__(
